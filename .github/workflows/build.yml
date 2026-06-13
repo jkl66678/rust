@@ -1,0 +1,31 @@
+name: Build Android aarch64 Binary
+
+# 触发规则：推送代码 / 手动点击都能编译
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install cross compile tool
+        run: cargo install cross
+
+      - name: Compile release binary
+        run: cross build --release --target aarch64-unknown-linux-musl
+
+      - name: Upload binary to download
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-rust-bin
+          path: target/aarch64-unknown-linux-musl/release/anr_tool
