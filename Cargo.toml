@@ -6,7 +6,6 @@ authors = []
 description = ""
 license = "MIT"
 
-# 依赖写这里，现在先留空
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 rayon = "1.10"
