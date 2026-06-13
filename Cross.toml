@@ -1,0 +1,5 @@
+[target.aarch64-unknown-linux-musl]
+pre-build = [
+    "apt-get update -y",
+    "apt-get install -y --no-install-recommends libc6-dev"
+]
