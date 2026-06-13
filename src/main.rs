@@ -14,6 +14,7 @@ const PID_FILE: &str = "/data/adb/anr_cleaner.pid";
 
 const SAFE_CLEAN_PATHS: &[&str] = &[
     "/data/anr",
+    "/anr",
     "/data/system/dropbox",
     "/data/tombstones",
     "/data/aee_exp",
@@ -385,50 +386,9 @@ fn menu_start() {
     println!("✨ 特性: 零unsafe, 单线程无锁, 变更检测低功耗, 无日志");
 
     let exe = std::env::current_exe().unwrap_or_default();
-    let mut cmd = Command::new(&exe);
-    cmd.arg("daemon").arg(interval.to_string());
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::null());
-
-    match cmd.spawn() {
-        Ok(_child) => {
-            for _ in 0..50 {
-                thread::sleep(Duration::from_millis(100));
-                if is_running() {
-                    println!("✅ 启动成功 | PID: {} | 间隔: {}s", get_pid().unwrap_or(0), interval);
-                    println!("📌 安全清理: {:?}", SAFE_CLEAN_PATHS);
-                    println!("📌 全量删除: {:?}", FULL_DELETE_PATHS);
-                    println!("📌 权限目录: {:?}", PERM_FIX_PATHS);
-                    println!("📌 权限模式: {:o}", DEFAULT_PERM_MODE);
-                    println!("📌 时间戳文件: {:?}", TIMESTAMP_TARGETS);
-                    return;
-                }
-            }
-            println!("❌ 启动失败: PID 文件未写入");
-        }
-        Err(e) => println!("❌ 启动失败: {}", e),
-    }
-}
-
-fn menu_start() {
-    if is_running() {
-        println!("⚠️ 运行中 (PID:{})", get_pid().unwrap_or(0));
-        return;
-    }
-
-    print!("间隔(秒, 回车默认{}s): ", DEFAULT_INTERVAL);
-    let _ = io::stdout().flush();
-    let input = read_line();
-    let interval: u64 = input.parse().unwrap_or(DEFAULT_INTERVAL);
-
-    println!("=== ANR清理+权限+时间戳 Safe Rust低功耗版 ===");
-    println!("✨ 特性: 零unsafe, 单线程无锁, 变更检测低功耗, 无日志");
-
-    let exe = std::env::current_exe().unwrap_or_default();
     let exe_str = exe.to_str().unwrap_or("");
 
-    // 优先尝试 setsid，失败则回退到直接 spawn
+    // 优先 setsid 脱离终端，失败回退直接 spawn
     let result = {
         let mut cmd = Command::new("/system/bin/setsid");
         cmd.arg(exe_str)
@@ -441,9 +401,8 @@ fn menu_start() {
     };
 
     match result {
-        Ok(_child) => {}
+        Ok(_) => {}
         Err(_) => {
-            // 回退：直接 spawn（终端关闭仍会退出，但兼容旧系统）
             let mut cmd = Command::new(exe_str);
             cmd.arg("daemon").arg(interval.to_string());
             cmd.stdin(Stdio::null());
@@ -466,6 +425,20 @@ fn menu_start() {
         }
     }
     println!("❌ 启动失败: PID 文件未写入");
+}
+
+fn menu_stop() {
+    if !is_running() {
+        println!("❌ 未运行");
+        return;
+    }
+
+    let pid_mgr = PidManager::new(PathBuf::from(PID_FILE));
+    match pid_mgr.stop() {
+        Ok(true) => println!("✅ 已完全终止"),
+        Ok(false) => println!("❌ 终止失败, 手动: kill -9 {}", get_pid().unwrap_or(0)),
+        Err(e) => println!("❌ 错误: {}", e),
+    }
 }
 
 fn menu_status() {
