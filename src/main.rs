@@ -15,7 +15,7 @@ const PID_FILE: &str = "/data/adb/anr_cleaner.pid";
 
 const SAFE_CLEAN_PATHS: &[&str] = &[
     "/data/anr",
-    "//anr",
+    "/anr",
     "/data/system/dropbox",
     "/data/tombstones",
     "/data/aee_exp",
