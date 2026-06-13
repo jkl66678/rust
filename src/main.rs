@@ -498,7 +498,6 @@ fn main() {
 }
     "/data/media/0/Download/QQ",
     "/data/media/0/Download/.csj",
-];
 
 const PERM_FIX_PATHS: &[&str] = &[
     "/data/media/0/Android/data",
