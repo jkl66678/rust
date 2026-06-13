@@ -1,6 +1,8 @@
-[target.aarch64-linux-android]
-# cross 自动拉取 Android NDK 环境，适配 bionic
+[target.aarch64-unknown-linux-musl]
 pre-build = [
     "apt-get update -y",
     "apt-get install -y --no-install-recommends libc6-dev"
 ]
+
+[env]
+RUSTFLAGS = "-C opt-level=3 -C codegen-units=1 -C panic=abort"
