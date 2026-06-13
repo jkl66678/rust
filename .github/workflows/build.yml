@@ -1,4 +1,4 @@
-name: Build Android Native (cross + nix + strip)
+name: Build Android Musl (cross + nix + strip)
 on:
   push:
     branches: [ main ]
@@ -13,21 +13,21 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android
+          targets: aarch64-unknown-linux-musl
 
       - name: Install cross
         run: cargo install cross
 
       - name: Cross build release
-        run: cross build --release --target aarch64-linux-android
+        run: cross build --release --target aarch64-unknown-linux-musl
 
-      - name: Strip 瘦身
+      - name: Strip binary
         run: |
-          cross run --target aarch64-linux-android -- \
-            aarch64-linux-android-strip target/aarch64-linux-android/release/anr_tool
+          cross run --target aarch64-unknown-linux-musl -- \
+            aarch64-linux-musl-strip target/aarch64-unknown-linux-musl/release/anr_tool
 
-      - name: Upload
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: anr_tool-android-native
-          path: target/aarch64-linux-android/release/anr_tool
+          name: anr_tool-android-musl
+          path: target/aarch64-unknown-linux-musl/release/anr_tool
