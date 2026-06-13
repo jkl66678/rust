@@ -8,3 +8,15 @@ license = "MIT"
 
 # 依赖写这里，现在先留空
 [dependencies]
+clap = { version = "4.5", features = ["derive"] }
+rayon = "1.10"
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.11"
+filetime = "0.2"
+walkdir = "2.5"
+chrono = "0.4"
+nix = { version = "0.29", features = ["process", "signal"] }
+signal-hook = "0.3"
+ctrlc = "3.4"
+libc = "0.2"
