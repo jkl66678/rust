@@ -1,4 +1,4 @@
-name: Build with cross + nix + strip
+name: Build Android Native (cross + nix + strip)
 on:
   push:
     branches: [ main ]
@@ -8,32 +8,26 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # 安装 Rust 工具链 + 编译目标
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-unknown-linux-musl
+          targets: aarch64-linux-android
 
-      # 安装 cross 工具
       - name: Install cross
         run: cargo install cross
 
-      # cross 编译 release 版本
-      - name: Cross build
-        run: cross build --release --target aarch64-unknown-linux-musl
+      - name: Cross build release
+        run: cross build --release --target aarch64-linux-android
 
-      # 在 cross 容器内执行 strip 精简二进制
-      - name: Strip binary
+      - name: Strip 瘦身
         run: |
-          cross run --target aarch64-unknown-linux-musl -- \
-            aarch64-linux-musl-strip target/aarch64-unknown-linux-musl/release/anr_tool
+          cross run --target aarch64-linux-android -- \
+            aarch64-linux-android-strip target/aarch64-linux-android/release/anr_tool
 
-      # 上传编译产物
-      - name: Upload artifact
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: anr_tool-android-musl
-          path: target/aarch64-unknown-linux-musl/release/anr_tool
+          name: anr_tool-android-native
+          path: target/aarch64-linux-android/release/anr_tool
