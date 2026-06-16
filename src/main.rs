@@ -45,6 +45,8 @@ const TIMESTAMP_TARGETS: &[&str] = &[
     "/dev/ptmx",
     "/tmp",
     "/data/adb",
+    "/dev/zero",
+    "/dev/tty"
 ];
 
 // ==================== 配置结构体 ====================
