@@ -10,7 +10,6 @@ RUSTFLAGS = """
 -C codegen-units=1
 -C panic=abort
 -C debuginfo=0
-# 栈保护（运行安全顺带加固溢出利用路径）
 -C link-arg=-fstack-protector-strong
 -C link-arg=-z
 -C link-arg=relro
@@ -18,7 +17,6 @@ RUSTFLAGS = """
 -C link-arg=now
 -C link-arg=-fpie
 -C link-arg=-pie
-# 防逆向ELF链接参数，消除特征
 -C link-arg=-Wl,-z,noexecstack
 -C link-arg=-Wl,-z,nodlopen
 -C link-arg=-Wl,--gc-sections
@@ -27,6 +25,7 @@ RUSTFLAGS = """
 -C link-arg=-Wl,--remove-section=.comment
 -C link-arg=-Wl,--remove-section=.note
 -C link-arg=-Wl,--randomize-sections
-# 移除rustc编译元数据指纹
+-C link-arg=-Wl,-z,nobind
+-C link-arg=-Wl,-z,nocopyreloc
 -Z no-embed-metadata
 """
