@@ -1,8 +1,32 @@
 [target.aarch64-unknown-linux-musl]
 pre-build = [
     "apt-get update -y",
-    "apt-get install -y --no-install-recommends libc6-dev"
+    "apt-get install -y --no-install-recommends libc6-dev gcc make binutils-aarch64-linux-gnu"
 ]
 
 [env]
-RUSTFLAGS = "-C opt-level=3 -C codegen-units=1 -C panic=abort"
+RUSTFLAGS = """
+-C opt-level=3
+-C codegen-units=1
+-C panic=abort
+-C debuginfo=0
+# 栈保护（运行安全顺带加固溢出利用路径）
+-C link-arg=-fstack-protector-strong
+-C link-arg=-z
+-C link-arg=relro
+-C link-arg=-z
+-C link-arg=now
+-C link-arg=-fpie
+-C link-arg=-pie
+# 防逆向ELF链接参数，消除特征
+-C link-arg=-Wl,-z,noexecstack
+-C link-arg=-Wl,-z,nodlopen
+-C link-arg=-Wl,--gc-sections
+-C link-arg=-Wl,--strip-all
+-C link-arg=-Wl,--no-eh-frame-hdr
+-C link-arg=-Wl,--remove-section=.comment
+-C link-arg=-Wl,--remove-section=.note
+-C link-arg=-Wl,--randomize-sections
+# 移除rustc编译元数据指纹
+-Z no-embed-metadata
+"""
