@@ -6,6 +6,19 @@ authors = []
 description = ""
 license = "MIT"
 
+[profile.release]
+# 防逆向核心配置
+opt-level = 3
+lto = true                  # 全局链接时优化，抹平函数边界，大幅提升反编译难度
+codegen-units = 1           # 单编译单元，消除分段特征
+panic = "abort"             # 移除panic字符串、栈展开元数据
+strip = "symbols"           # 编译阶段自动剥离符号
+debug = false
+debug-assertions = false
+overflow-checks = false
+# 强制禁用内置源码路径字符串
+remap-path-prefix = { "." = "" }
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 rayon = "1.10"
