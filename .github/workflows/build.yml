@@ -1,4 +1,4 @@
-name: Build Android Musl (cross + nix + strip)
+name: Build Anti-Reverse Musl (Zero Code Modify)
 on:
   push:
     branches: [ main ]
@@ -21,13 +21,28 @@ jobs:
       - name: Cross build release
         run: cross build --release --target aarch64-unknown-linux-musl
 
-      - name: Strip binary
+      # 第一层：容器内架构专用strip
+      - name: Strip inside cross container
         run: |
           cross run --target aarch64-unknown-linux-musl -- \
-            aarch64-linux-musl-strip target/aarch64-unknown-linux-musl/release/anr_tool
+            aarch64-linux-musl-strip --strip-all target/aarch64-unknown-linux-musl/release/anr_tool
+
+      # 第二层：主机objcopy深度删除ELF特征段
+      - name: Deep ELF feature section wipe
+        run: |
+          sudo apt install binutils-aarch64-linux-gnu -y
+          aarch64-linux-gnu-objcopy \
+            --remove-section=.rodata.cst16 \
+            --remove-section=.symtab \
+            --remove-section=.strtab \
+            target/aarch64-unknown-linux-musl/release/anr_tool
+
+      # 第三层：再次全量strip收尾
+      - name: Final full strip
+        run: aarch64-linux-gnu-strip --strip-all target/aarch64-unknown-linux-musl/release/anr_tool
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: anr_tool-android-musl
+          name: anr_tool-anti-reverse
           path: target/aarch64-unknown-linux-musl/release/anr_tool
