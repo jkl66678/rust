@@ -24,10 +24,7 @@ struct ThreadCpuSample {
 }
 
 const BLACK_LIST: &[&str] = &["ace", "Thread-"];
-
-/// 每一轮步进幅度，越小爬坡越平缓，建议1；不要大于2
 const STEP: i32 = 1;
-/// nice硬上限，最低优先级
 const MAX_NICE: i32 = 19;
 
 fn is_blacklist_target(comm: &str) -> bool {
@@ -87,8 +84,9 @@ fn get_tid_cpu_percent(tid: u32, cache: &mut HashMap<u32, ThreadCpuSample>) -> O
     Some(cpu_pct.clamp(0.0, 100.0))
 }
 
+// 替换fs::try_exists，兼容旧rust版本
 fn is_process_alive(pid: u32) -> bool {
-    fs::try_exists(format!("/proc/{pid}")).unwrap_or(false)
+    fs::metadata(format!("/proc/{pid}")).is_ok()
 }
 
 fn scan_game_threads(
@@ -111,8 +109,14 @@ fn scan_game_threads(
     const PULSE_HIGH: u32 = 2;
 
     for entry in dir_entries.flatten() {
-        let tid_str = entry.file_name().into_string().ok()?;
-        let tid: u32 = tid_str.parse().ok()?;
+        let tid_str = match entry.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let tid = match tid_str.parse::<u32>() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
         alive_tids.push(tid);
 
         let comm = match get_tid_comm(tid) {
@@ -137,17 +141,13 @@ fn scan_game_threads(
             }
         });
 
-        // ace线程直接设置目标档位 origin+5，然后缓缓爬坡
         if comm.contains("ace") {
             state.target_nice = std::cmp::min(state.origin_nice + 5, MAX_NICE);
             state.is_limited = true;
         } else if comm.starts_with("Thread-") {
             let cpu = match get_tid_cpu_percent(tid, cpu_cache) {
                 Some(v) => v,
-                None => {
-                    //无有效CPU采样，不改变target，维持现状
-                    continue;
-                }
+                None => continue,
             };
 
             if cpu > HIGH_THRESHOLD {
@@ -158,35 +158,28 @@ fn scan_game_threads(
                 state.pulse_cnt = 0;
             }
 
-            // 根据状态设置目标nice，不是直接赋值current
             if state.high_sample_cnt >= SAMPLE_HIGH_TRIGGER {
-                //持续中频任务，目标origin+3
                 state.target_nice = std::cmp::min(state.origin_nice + 3, MAX_NICE);
                 state.is_limited = true;
             } else if state.pulse_cnt >= PULSE_HIGH {
-                //高频脉冲，目标origin+5
                 state.target_nice = std::cmp::min(state.origin_nice + 5, MAX_NICE);
                 state.is_limited = true;
             } else {
-                //低频脉冲，目标origin+1
                 state.target_nice = std::cmp::min(state.origin_nice + 1, MAX_NICE);
                 state.is_limited = true;
             }
 
-            //负载回落，目标切回原始nice，开始缓慢回落
             if cpu <= HIGH_THRESHOLD {
                 state.high_sample_cnt = 0;
                 if state.is_limited {
                     state.low_sample_cnt += 1;
                     if state.low_sample_cnt >= SAMPLE_LOW_RECOVER {
                         state.target_nice = state.origin_nice;
-                        //不要立刻关闭is_limited；要等current_nice走完回落再重置状态
                     }
                 }
             }
         }
 
-        // =========核心：渐进步进，缓缓向target靠拢=========
         if state.current_nice < state.target_nice {
             state.current_nice += STEP;
             state.current_nice = state.current_nice.min(MAX_NICE);
@@ -194,7 +187,6 @@ fn scan_game_threads(
         } else if state.current_nice > state.target_nice {
             state.current_nice -= STEP;
             let _ = set_tid_nice(tid, state.current_nice);
-            //回落到达原点，重置状态标记
             if state.current_nice == state.origin_nice {
                 state.is_limited = false;
                 state.low_sample_cnt = 0;
@@ -208,7 +200,6 @@ fn scan_game_threads(
 }
 
 fn restore_all_threads(state_map: &mut HashMap<u32, ThreadState>) {
-    //程序整体退出瞬间强制复原全部，兜底保护
     for (tid, state) in state_map.iter_mut() {
         state.current_nice = state.origin_nice;
         state.target_nice = state.origin_nice;
@@ -218,14 +209,25 @@ fn restore_all_threads(state_map: &mut HashMap<u32, ThreadState>) {
 }
 
 #[tokio::main]
-async fn main() {
-    let game_pid: u32 = 0;
+async fn main() -> std::io::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        eprintln!("Usage: {} <pid>", args[0]);
+        std::process::exit(1);
+    }
+    let game_pid = match args[1].parse::<u32>() {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("invalid pid");
+            std::process::exit(1);
+        }
+    };
+
     let mut thread_state = HashMap::new();
     let mut cpu_sample_cache = HashMap::new();
-    //扫描周期500ms；STEP=1，每500ms变化1个nice单位
     let mut tick = interval(Duration::from_millis(500));
 
-    println!("slow‑ramp thread controller, target pid:{}", game_pid);
+    println!("slow-ramp thread controller, target pid:{}", game_pid);
 
     loop {
         tick.tick().await;
@@ -236,4 +238,5 @@ async fn main() {
         }
         scan_game_threads(game_pid, &mut thread_state, &mut cpu_sample_cache);
     }
+    Ok(())
 }
