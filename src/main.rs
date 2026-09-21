@@ -1,47 +1,82 @@
-use libc::{c_int, c_void};
-use std::arch::asm;
+use regex::Regex;
+use std::fs;
+use std::io;
+use std::path::Path;
+use std::thread;
+use std::time::Duration;
 
-// 原始syscall号 aarch64
+const GAME_PACKAGE: &str = "com.tencent.tmgp.dfm";
+const WAIT_SLEEP: Duration = Duration::from_millis(500);
+const SCAN_SLEEP: Duration = Duration::from_millis(250);
+const POST_EXIT_SLEEP: Duration = Duration::from_millis(800);
+const NICE_TARGET: i32 = 19;
+type Pid = i64;
+
+// AArch64 Linux syscall numbers
 const SYS_setsid: usize = 115;
 const SYS_setpriority: usize = 140;
 const SYS_openat: usize = 56;
 const SYS_dup2: usize = 24;
 const SYS_close: usize = 57;
+const AT_FDCWD: usize = -100isize as usize;
+const O_RDWR: usize = 0o2;
+const O_CLOEXEC: usize = 0o200000;
+const STDIN_FILENO: usize = 0;
+const STDOUT_FILENO: usize = 1;
+const STDERR_FILENO: usize = 2;
 
 #[inline(always)]
 unsafe fn syscall0(nr: usize) -> usize {
     let ret: usize;
-    asm!("svc #0", out("x0") ret, in("x0") nr, options(nostack));
+    std::arch::asm!("svc #0", out("x0") ret, in("x0") nr, options(nostack));
     ret
 }
+
 #[inline(always)]
 unsafe fn syscall3(nr: usize, a1: usize, a2: usize, a3: usize) -> usize {
     let ret: usize;
-    asm!("svc #0", out("x0") ret, in("x0") nr, in("x1") a1, in("x2") a2, in("x3") a3, options(nostack));
+    std::arch::asm!("svc #0", out("x0") ret, in("x0") nr, in("x1") a1, in("x2") a2, in("x3") a3, options(nostack));
     ret
 }
 
 fn daemonize() {
     unsafe {
         syscall0(SYS_setsid);
-        // open /dev/null
-        let devnull = syscall3(SYS_openat, libc::AT_FDCWD as usize, b"/dev/null\0".as_ptr() as usize, (libc::O_RDWR | libc::O_CLOEXEC) as usize, 0o666);
-        if devnull as c_int >= 0 {
-            syscall3(SYS_dup2, devnull, libc::STDIN_FILENO as usize, 0);
-            syscall3(SYS_dup2, devnull, libc::STDOUT_FILENO as usize, 0);
-            syscall3(SYS_dup2, devnull, libc::STDERR_FILENO as usize, 0);
+        let devnull = syscall3(SYS_openat, AT_FDCWD, b"/dev/null\0".as_ptr() as usize, O_RDWR | O_CLOEXEC, 0o666);
+        if devnull as i64 >= 0 {
+            syscall3(SYS_dup2, devnull, STDIN_FILENO, 0);
+            syscall3(SYS_dup2, devnull, STDOUT_FILENO, 0);
+            syscall3(SYS_dup2, devnull, STDERR_FILENO, 0);
             syscall0(SYS_close);
         }
     }
 }
 
-/// setpriority(PRIO_PROCESS, tid, nice)
-fn set_tid_nice(tid: libc::pid_t, nice: i32) {
+fn set_tid_nice(tid: Pid, nice: i32) {
     unsafe {
         // PRIO_PROCESS = 0
         syscall3(SYS_setpriority, 0, tid as usize, nice as usize);
     }
 }
+
+fn find_game_pid() -> Option<Pid> {
+    let dir = fs::read_dir("/proc").ok()?;
+    for entry in dir {
+        let entry = entry.ok()?;
+        let fname = entry.file_name();
+        let fname_str = fname.to_str()?;
+        let pid: Pid = fname_str.parse().ok()?;
+        let cmdline_path = entry.path().join("cmdline");
+        let mut buf = fs::read(cmdline_path).ok()?;
+        if let Some(nul_pos) = buf.iter().position(|&b| b == b'\0') {
+            buf.truncate(nul_pos);
+        }
+        let cmd = String::from_utf8_lossy(&buf);
+        if cmd.contains(GAME_PACKAGE) {
+            return Some(pid);
+        }
+    }
+    None
 }
 
 fn read_comm(pid: Pid, tid: Pid) -> io::Result<String> {
@@ -55,7 +90,6 @@ fn read_utime(pid: Pid, tid: Pid) -> io::Result<u64> {
     let p = format!("/proc/{}/task/{}/stat", pid, tid);
     let content = fs::read_to_string(p)?;
     let mut iter = content.split_whitespace();
-    // 第14项是utime，索引13
     iter.nth(13)
         .and_then(|v| v.parse().ok())
         .ok_or(io::Error::new(io::ErrorKind::InvalidData, "utime parse fail"))
@@ -82,21 +116,6 @@ fn list_tids(pid: Pid) -> Vec<Pid> {
     tids
 }
 
-fn daemonize() {
-    unsafe {
-        // 脱离终端会话
-        setsid();
-        // 重定向 stdin/stdout/stderr 到 /dev/null
-        let devnull = open(c"/dev/null".as_ptr(), O_RDWR | O_CLOEXEC, 0o666);
-        if devnull >= 0 {
-            libc::dup2(devnull, libc::STDIN_FILENO);
-            libc::dup2(devnull, libc::STDOUT_FILENO);
-            libc::dup2(devnull, libc::STDERR_FILENO);
-            libc::close(devnull);
-        }
-    }
-}
-
 fn main() {
     daemonize();
     let re = Regex::new(r"^Thread-[0-9]+$").unwrap();
@@ -110,7 +129,6 @@ fn main() {
             }
         };
 
-        // 游戏运行循环
         loop {
             let proc_path = format!("/proc/{}", game_pid);
             if !Path::new(&proc_path).exists() {
@@ -131,9 +149,7 @@ fn main() {
                     Err(_) => continue,
                 };
                 if utime > 0 {
-                    unsafe {
-                        setpriority(PRIO_PROCESS, tid as u32, NICE_TARGET);
-                    }
+                    set_tid_nice(tid, NICE_TARGET);
                 }
             }
             thread::sleep(SCAN_SLEEP);
