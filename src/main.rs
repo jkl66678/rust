@@ -1,7 +1,7 @@
 use regex::Regex;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -18,6 +18,7 @@ const SYS_setpriority: usize = 140;
 const SYS_openat: usize = 56;
 const SYS_dup2: usize = 24;
 const SYS_close: usize = 57;
+
 const AT_FDCWD: usize = -100isize as usize;
 const O_RDWR: usize = 0o2;
 const O_CLOEXEC: usize = 0o200000;
@@ -28,21 +29,29 @@ const STDERR_FILENO: usize = 2;
 #[inline(always)]
 unsafe fn syscall0(nr: usize) -> usize {
     let ret: usize;
-    std::arch::asm!("svc #0", out("x0") ret, in("x0") nr, options(nostack));
+    std::arch::asm!("svc #0", lateout("x0") ret, in("x0") nr, options(nostack));
     ret
 }
 
 #[inline(always)]
 unsafe fn syscall3(nr: usize, a1: usize, a2: usize, a3: usize) -> usize {
     let ret: usize;
-    std::arch::asm!("svc #0", out("x0") ret, in("x0") nr, in("x1") a1, in("x2") a2, in("x3") a3, options(nostack));
+    std::arch::asm!("svc #0", lateout("x0") ret, in("x0") nr, in("x1") a1, in("x2") a2, in("x3") a3, options(nostack));
+    ret
+}
+
+#[inline(always)]
+unsafe fn syscall4(nr: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
+    let ret: usize;
+    std::arch::asm!("svc #0", lateout("x0") ret, in("x0") nr, in("x1") a1, in("x2") a2, in("x3") a3, in("x4") a4, options(nostack));
     ret
 }
 
 fn daemonize() {
     unsafe {
         syscall0(SYS_setsid);
-        let devnull = syscall3(SYS_openat, AT_FDCWD, b"/dev/null\0".as_ptr() as usize, O_RDWR | O_CLOEXEC, 0o666);
+        // openat: nr, dirfd, path, flags, mode
+        let devnull = syscall4(SYS_openat, AT_FDCWD, b"/dev/null\0".as_ptr() as usize, O_RDWR | O_CLOEXEC, 0o666);
         if devnull as i64 >= 0 {
             syscall3(SYS_dup2, devnull, STDIN_FILENO, 0);
             syscall3(SYS_dup2, devnull, STDOUT_FILENO, 0);
@@ -96,12 +105,12 @@ fn read_utime(pid: Pid, tid: Pid) -> io::Result<u64> {
 }
 
 fn list_tids(pid: Pid) -> Vec<Pid> {
-    let mut tids = Vec::new();
-    let task_path = Path::new(&format!("/proc/{}/task", pid));
-    let dir = match fs::read_dir(task_path) {
+    let task_path_buf = PathBuf::from(format!("/proc/{}/task", pid));
+    let dir = match fs::read_dir(&task_path_buf) {
         Ok(d) => d,
-        Err(_) => return tids,
+        Err(_) => return Vec::new(),
     };
+    let mut tids = Vec::new();
     for entry in dir {
         let entry = match entry {
             Ok(e) => e,
@@ -130,8 +139,8 @@ fn main() {
         };
 
         loop {
-            let proc_path = format!("/proc/{}", game_pid);
-            if !Path::new(&proc_path).exists() {
+            let proc_buf = PathBuf::from(format!("/proc/{}", game_pid));
+            if !proc_buf.exists() {
                 break;
             }
 
