@@ -1,7 +1,15 @@
 use std::collections::HashMap;
 use std::fs;
+use std::os::unix::io::RawFd;
+use std::path::Path;
 use std::time::{Duration, Instant};
-use tokio::time::interval;
+use tokio::time::{interval, sleep};
+
+const PID_FILE: &str = "/data/adb/dfm-daemon.pid";
+const BLACK_LIST: &[&str] = &["ace", "Thread-"];
+const STEP: i32 = 1;
+const MAX_NICE: i32 = 19;
+const GAME_PACKAGE: &str = "com.tencent.tmgp.dfm";
 
 #[derive(Debug, Default)]
 struct ThreadState {
@@ -23,9 +31,73 @@ struct ThreadCpuSample {
     sample_time: Instant,
 }
 
-const BLACK_LIST: &[&str] = &["ace", "Thread-"];
-const STEP: i32 = 1;
-const MAX_NICE: i32 = 19;
+// 单实例校验
+fn check_single_instance() -> bool {
+    let p = Path::new(PID_FILE);
+    if !p.exists() {
+        return true;
+    }
+    let content = match fs::read_to_string(p) {
+        Ok(s) => s,
+        Err(_) => {
+            let _ = fs::remove_file(p);
+            return true;
+        }
+    };
+    let old_pid: u32 = match content.trim().parse() {
+        Ok(num) => num,
+        Err(_) => {
+            let _ = fs::remove_file(p);
+            return true;
+        }
+    };
+    if fs::metadata(format!("/proc/{old_pid}")).is_ok() {
+        eprintln!("already running, pid={old_pid}, refuse new instance");
+        return false;
+    }
+    let _ = fs::remove_file(p);
+    true
+}
+
+fn write_pid_file() -> std::io::Result<()> {
+    let pid = unsafe { libc::getpid() };
+    fs::write(PID_FILE, pid.to_string())
+}
+
+fn clean_pid_file() {
+    let _ = fs::remove_file(PID_FILE);
+}
+
+fn daemonize() -> std::io::Result<()> {
+    unsafe {
+        match libc::fork() {
+            -1 => return Err(std::io::Error::last_os_error()),
+            0 => {}
+            parent => {
+                std::process::exit(0);
+            }
+        }
+        let sid = libc::setsid();
+        if sid == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        match libc::fork() {
+            -1 => return Err(std::io::Error::last_os_error()),
+            0 => {}
+            _ => {
+                std::process::exit(0);
+            }
+        }
+        let devnull = libc::open(b"/dev/null\0".as_ptr(), libc::O_RDWR, 0o644);
+        libc::dup2(devnull, libc::STDIN_FILENO as RawFd);
+        libc::dup2(devnull, libc::STDOUT_FILENO as RawFd);
+        libc::dup2(devnull, libc::STDERR_FILENO as RawFd);
+        if devnull > 2 {
+            libc::close(devnull);
+        }
+    }
+    Ok(())
+}
 
 fn is_blacklist_target(comm: &str) -> bool {
     BLACK_LIST.iter().any(|s| comm.contains(s))
@@ -84,7 +156,6 @@ fn get_tid_cpu_percent(tid: u32, cache: &mut HashMap<u32, ThreadCpuSample>) -> O
     Some(cpu_pct.clamp(0.0, 100.0))
 }
 
-// 替换fs::try_exists，兼容旧rust版本
 fn is_process_alive(pid: u32) -> bool {
     fs::metadata(format!("/proc/{pid}")).is_ok()
 }
@@ -208,35 +279,90 @@ fn restore_all_threads(state_map: &mut HashMap<u32, ThreadState>) {
     state_map.clear();
 }
 
+fn find_game_pid(pkg: &str) -> Option<u32> {
+    let dir = fs::read_dir("/proc").ok()?;
+    for entry in dir.flatten() {
+        let filename = entry.file_name();
+        let pid_str = match filename.into_string() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let pid: u32 = match pid_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let cmdline_path = format!("/proc/{pid}/cmdline");
+        let cmdline = match fs::read(cmdline_path) {
+            Ok(buf) => buf,
+            Err(_) => continue,
+        };
+        let cmd_str = String::from_utf8_lossy(&cmdline);
+        if cmd_str.contains(pkg) {
+            return Some(pid);
+        }
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <pid>", args[0]);
+    // 第一步：单实例检查
+    if !check_single_instance() {
         std::process::exit(1);
     }
-    let game_pid = match args[1].parse::<u32>() {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("invalid pid");
-            std::process::exit(1);
-        }
-    };
 
+    // 环境变量 DFM_FOREGROUND=1 前台调试，不daemon
+    let foreground = std::env::var("DFM_FOREGROUND").is_ok();
+    if !foreground {
+        daemonize()?;
+    }
+
+    write_pid_file()?;
+
+    use tokio::signal;
     let mut thread_state = HashMap::new();
     let mut cpu_sample_cache = HashMap::new();
-    let mut tick = interval(Duration::from_millis(500));
 
-    println!("slow-ramp thread controller, target pid:{}", game_pid);
+    let sig_task = tokio::spawn(async move {
+        signal::signal(signal::unix::SignalKind::interrupt()).unwrap().recv().await;
+    });
 
-    loop {
-        tick.tick().await;
-        if !is_process_alive(game_pid) {
-            println!("game process exit, force restore all nice");
-            restore_all_threads(&mut thread_state);
-            break;
+    let res: std::io::Result<()> = async {
+        loop {
+            let game_pid = loop {
+                match find_game_pid(GAME_PACKAGE) {
+                    Some(pid) => {
+                        if foreground {
+                            println!("Detect game start, pid={pid}");
+                        }
+                        break pid;
+                    }
+                    None => sleep(Duration::from_secs(1)).await,
+                }
+            };
+            let mut tick = interval(Duration::from_millis(500));
+            loop {
+                tokio::select! {
+                    _ = &sig_task => {
+                        restore_all_threads(&mut thread_state);
+                        return Ok(());
+                    }
+                    _ = tick.tick() => {
+                        if !is_process_alive(game_pid) {
+                            if foreground {
+                                println!("Game exited, restore threads, back waiting");
+                            }
+                            restore_all_threads(&mut thread_state);
+                            break;
+                        }
+                        scan_game_threads(game_pid, &mut thread_state, &mut cpu_sample_cache);
+                    }
+                }
+            }
         }
-        scan_game_threads(game_pid, &mut thread_state, &mut cpu_sample_cache);
-    }
-    Ok(())
+    }.await;
+
+    restore_all_threads(&mut thread_state);
+    clean_pid_file();
+    res
 }
