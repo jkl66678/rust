@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use signal_hook::{consts::SIGINT, consts::SIGTERM, iterator::Signals};
@@ -87,11 +88,14 @@ fn main() {
     let mut signals = Signals::new(&[SIGINT, SIGTERM]).unwrap();
     let mut thread_map: HashMap<u32, ThreadState> = HashMap::new();
     let sample_count = (WINDOW_SEC * 1000 / SAMPLE_INTERVAL_MS) as usize;
-    let mut restore_list: Vec<(u32, i32)> = Vec::new();
+    // 用Arc+Mutex 多线程共享恢复列表
+    let restore_list: Arc<Mutex<Vec<(u32, i32)>>> = Arc::new(Mutex::new(Vec::new()));
+    let restore_clone = Arc::clone(&restore_list);
 
     std::thread::spawn(move || {
         for _ in signals.forever() {
-            for (tid, old_nice) in restore_list.iter() {
+            let list = restore_clone.lock().unwrap();
+            for (tid, old_nice) in list.iter() {
                 let _ = set_tid_nice(*tid, *old_nice);
             }
             std::process::exit(0);
@@ -145,8 +149,9 @@ fn main() {
                 if trigger && current_nice < TARGET_NICE {
                     if set_tid_nice(tid, TARGET_NICE) {
                         if let Some(old) = entry.original_nice {
-                            if !restore_list.iter().any(|(t,_)| *t == tid) {
-                                restore_list.push((tid, old));
+                            let mut guard = restore_list.lock().unwrap();
+                            if !guard.iter().any(|(t,_)| *t == tid) {
+                                guard.push((tid, old));
                             }
                         }
                     }
