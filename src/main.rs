@@ -1,39 +1,47 @@
-use libc::{open, setsid, PRIO_PROCESS, setpriority, O_RDWR, O_CLOEXEC, c_int};
-use regex::Regex;
-use std::fs;
-use std::io;
-use std::os::unix::io::FromRawFd;
-use std::path::Path;
-use std::thread;
-use std::time::Duration;
+use libc::{c_int, c_void};
+use std::arch::asm;
 
-const GAME_PACKAGE: &str = "com.tencent.tmgp.dfm";
-const WAIT_SLEEP: Duration = Duration::from_millis(500);
-const SCAN_SLEEP: Duration = Duration::from_millis(250);
-const POST_EXIT_SLEEP: Duration = Duration::from_millis(800);
-const NICE_TARGET: i32 = 19;
+// 原始syscall号 aarch64
+const SYS_setsid: usize = 115;
+const SYS_setpriority: usize = 140;
+const SYS_openat: usize = 56;
+const SYS_dup2: usize = 24;
+const SYS_close: usize = 57;
 
-type Pid = libc::pid_t;
+#[inline(always)]
+unsafe fn syscall0(nr: usize) -> usize {
+    let ret: usize;
+    asm!("svc #0", out("x0") ret, in("x0") nr, options(nostack));
+    ret
+}
+#[inline(always)]
+unsafe fn syscall3(nr: usize, a1: usize, a2: usize, a3: usize) -> usize {
+    let ret: usize;
+    asm!("svc #0", out("x0") ret, in("x0") nr, in("x1") a1, in("x2") a2, in("x3") a3, options(nostack));
+    ret
+}
 
-fn find_game_pid() -> Option<Pid> {
-    let dir = fs::read_dir("/proc").ok()?;
-    for entry in dir {
-        let entry = entry.ok()?;
-        let fname = entry.file_name();
-        let fname_str = fname.to_str()?;
-        let pid: Pid = fname_str.parse().ok()?;
-
-        let cmdline_path = entry.path().join("cmdline");
-        let mut buf = fs::read(cmdline_path).ok()?;
-        if let Some(nul_pos) = buf.iter().position(|&b| b == b'\0') {
-            buf.truncate(nul_pos);
-        }
-        let cmd = String::from_utf8_lossy(&buf);
-        if cmd.contains(GAME_PACKAGE) {
-            return Some(pid);
+fn daemonize() {
+    unsafe {
+        syscall0(SYS_setsid);
+        // open /dev/null
+        let devnull = syscall3(SYS_openat, libc::AT_FDCWD as usize, b"/dev/null\0".as_ptr() as usize, (libc::O_RDWR | libc::O_CLOEXEC) as usize, 0o666);
+        if devnull as c_int >= 0 {
+            syscall3(SYS_dup2, devnull, libc::STDIN_FILENO as usize, 0);
+            syscall3(SYS_dup2, devnull, libc::STDOUT_FILENO as usize, 0);
+            syscall3(SYS_dup2, devnull, libc::STDERR_FILENO as usize, 0);
+            syscall0(SYS_close);
         }
     }
-    None
+}
+
+/// setpriority(PRIO_PROCESS, tid, nice)
+fn set_tid_nice(tid: libc::pid_t, nice: i32) {
+    unsafe {
+        // PRIO_PROCESS = 0
+        syscall3(SYS_setpriority, 0, tid as usize, nice as usize);
+    }
+}
 }
 
 fn read_comm(pid: Pid, tid: Pid) -> io::Result<String> {
