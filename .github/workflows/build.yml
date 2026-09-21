@@ -15,40 +15,27 @@ jobs:
         with:
           targets: aarch64-unknown-linux-musl
 
-      - name: Install cross
-        run: cargo install cross
+      - name: Install cross + binutils
+        run: |
+          cargo install cross
+          sudo apt update -y
+          sudo apt install binutils-aarch64-linux-gnu -y
 
       - name: Cross build release
         run: cross build --release --target aarch64-unknown-linux-musl
 
-      #【改动1】原来cross run会拉起qemu卡死，直接替换为宿主机gnu‑strip，其余步骤名字不变
+      # 第一层：strip，现在binutils已经提前装好
       - name: Strip inside cross container
         run: |
           aarch64-linux-gnu-strip --strip-all target/aarch64-unknown-linux-musl/release/anr_tool
 
-      # 第二层：主机objcopy深度删除ELF特征段（完全原样保留你的）
+      # 第二层：主机objcopy深度删除ELF特征段
       - name: Deep ELF feature section wipe
         run: |
-          sudo apt install binutils-aarch64-linux-gnu -y
           aarch64-linux-gnu-objcopy \
             --remove-section=.rodata.cst16 \
             --remove-section=.symtab \
             --remove-section=.strtab \
-            target/aarch64-unknown-linux-musl/release/anr_tool
-
-      # 第三层：再次全量strip收尾（原样）
-      - name: Final full strip
-        run: aarch64-linux-gnu-strip --strip-all target/aarch64-unknown-linux-musl/release/anr_tool
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: anr_tool-anti-reverse
-          path: target/aarch64-unknown-linux-musl/release/anr_tool
-            --remove-section=.symtab \
-            --remove-section=.strtab \
-            --remove-section=.comment \
-            --remove-section=.note \
             target/aarch64-unknown-linux-musl/release/anr_tool
 
       # 第三层：再次全量strip收尾
