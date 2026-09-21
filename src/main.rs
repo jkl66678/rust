@@ -1,7 +1,7 @@
-use regex::Regex;
+use libc::{setpriority, setsid, PRIO_PROCESS};
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
@@ -12,59 +12,30 @@ const POST_EXIT_SLEEP: Duration = Duration::from_millis(800);
 const NICE_TARGET: i32 = 19;
 type Pid = i64;
 
-// AArch64 Linux syscall numbers
-const SYS_setsid: usize = 115;
-const SYS_setpriority: usize = 140;
-const SYS_openat: usize = 56;
-const SYS_dup2: usize = 24;
-const SYS_close: usize = 57;
-
-const AT_FDCWD: usize = -100isize as usize;
-const O_RDWR: usize = 0o2;
-const O_CLOEXEC: usize = 0o200000;
-const STDIN_FILENO: usize = 0;
-const STDOUT_FILENO: usize = 1;
-const STDERR_FILENO: usize = 2;
-
-#[inline(always)]
-unsafe fn syscall0(nr: usize) -> usize {
-    let ret: usize;
-    std::arch::asm!("svc #0", lateout("x0") ret, in("x0") nr, options(nostack));
-    ret
-}
-
-#[inline(always)]
-unsafe fn syscall3(nr: usize, a1: usize, a2: usize, a3: usize) -> usize {
-    let ret: usize;
-    std::arch::asm!("svc #0", lateout("x0") ret, in("x0") nr, in("x1") a1, in("x2") a2, in("x3") a3, options(nostack));
-    ret
-}
-
-#[inline(always)]
-unsafe fn syscall4(nr: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
-    let ret: usize;
-    std::arch::asm!("svc #0", lateout("x0") ret, in("x0") nr, in("x1") a1, in("x2") a2, in("x3") a3, in("x4") a4, options(nostack));
-    ret
+fn is_thread_name(s: &str) -> bool {
+    let Some(num_part) = s.strip_prefix("Thread-") else {
+        return false;
+    };
+    num_part.chars().all(|c| c.is_ascii_digit())
 }
 
 fn daemonize() {
     unsafe {
-        syscall0(SYS_setsid);
-        // openat: nr, dirfd, path, flags, mode
-        let devnull = syscall4(SYS_openat, AT_FDCWD, b"/dev/null\0".as_ptr() as usize, O_RDWR | O_CLOEXEC, 0o666);
-        if devnull as i64 >= 0 {
-            syscall3(SYS_dup2, devnull, STDIN_FILENO, 0);
-            syscall3(SYS_dup2, devnull, STDOUT_FILENO, 0);
-            syscall3(SYS_dup2, devnull, STDERR_FILENO, 0);
-            syscall0(SYS_close);
+        setsid();
+        // 标准守护进程：把stdin/stdout/stderr重定向/dev/null
+        let fd = libc::open(b"/dev/null\0".as_ptr(), libc::O_RDWR);
+        if fd >= 0 {
+            libc::dup2(fd, 0);
+            libc::dup2(fd, 1);
+            libc::dup2(fd, 2);
+            libc::close(fd);
         }
     }
 }
 
 fn set_tid_nice(tid: Pid, nice: i32) {
     unsafe {
-        // PRIO_PROCESS = 0
-        syscall3(SYS_setpriority, 0, tid as usize, nice as usize);
+        setpriority(PRIO_PROCESS, tid as libc::id_t, nice);
     }
 }
 
@@ -127,7 +98,6 @@ fn list_tids(pid: Pid) -> Vec<Pid> {
 
 fn main() {
     daemonize();
-    let re = Regex::new(r"^Thread-[0-9]+$").unwrap();
 
     loop {
         let game_pid = match find_game_pid() {
@@ -150,7 +120,7 @@ fn main() {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                if !re.is_match(&comm) {
+                if !is_thread_name(&comm) {
                     continue;
                 }
                 let utime = match read_utime(game_pid, tid) {
