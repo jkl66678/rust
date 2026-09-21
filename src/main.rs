@@ -1,366 +1,156 @@
 use std::collections::HashMap;
 use std::fs;
-use std::os::unix::io::RawFd;
 use std::path::Path;
-use std::time::{Duration, Instant};
-use tokio::signal::unix::{signal, SignalKind};
-use tokio::time::{interval, sleep};
+use std::thread;
+use std::time::Duration;
+use signal_hook::{consts::SIGINT, consts::SIGTERM, iterator::Signals};
 
-const PID_FILE: &str = "/data/adb/dfm-daemon.pid";
-const BLACK_LIST: &[&str] = &["ace", "Thread-"];
-const STEP: i32 = 1;
-const MAX_NICE: i32 = 19;
-const GAME_PACKAGE: &str = "com.tencent.tmgp.dfm";
+// ========== 配置区 ==========
+const SAMPLE_INTERVAL_MS: u64 = 500;
+const WINDOW_SEC: u64 = 3;
+const AVG_CPU_THRESHOLD: f32 = 3.5;
+const BURST_INSTANT_THRESHOLD: f32 = 25.0;
+const TARGET_NICE: i32 = 4;
+const GAME_PKG: &str = "com.tencent.tmgp.dfm";
 
-#[derive(Debug, Default)]
+// 白名单：核心游戏线程，禁止修改nice
+const WHITELIST: [&str; 2] = ["GameThread", "RenderThread"];
+// 黑名单：需要监控的后台线程
+const BLACKLIST: [&str;4] = ["Thread-", "ace", "NativeThread", "TaskGraphNP 0"];
+
+#[derive(Debug)]
 struct ThreadState {
-    origin_nice: i32,
-    current_nice: i32,
-    target_nice: i32,
-
-    high_sample_cnt: u32,
-    low_sample_cnt: u32,
-    pulse_cnt: u32,
-
-    is_limited: bool,
+    cpu_samples: Vec<u64>,
+    original_nice: Option<i32>,
 }
 
-#[derive(Debug, Clone)]
-struct ThreadCpuSample {
-    utime: u64,
-    stime: u64,
-    sample_time: Instant,
+fn is_whitelist(comm: &str) -> bool {
+    WHITELIST.iter().any(|&s| comm == s)
 }
 
-// 单实例校验
-fn check_single_instance() -> bool {
-    let p = Path::new(PID_FILE);
-    if !p.exists() {
-        return true;
-    }
-    let content = match fs::read_to_string(p) {
-        Ok(s) => s,
-        Err(_) => {
-            let _ = fs::remove_file(p);
-            return true;
+fn is_blacklist(comm: &str) -> bool {
+    BLACKLIST.iter().any(|rule| {
+        if rule.ends_with('-') {
+            // Thread- 前缀匹配
+            comm.starts_with(rule)
+        } else {
+            comm.contains(rule)
         }
-    };
-    let old_pid: u32 = match content.trim().parse() {
-        Ok(num) => num,
-        Err(_) => {
-            let _ = fs::remove_file(p);
-            return true;
-        }
-    };
-    if fs::metadata(format!("/proc/{old_pid}")).is_ok() {
-        eprintln!("already running, pid={old_pid}, refuse new instance");
-        return false;
-    }
-    let _ = fs::remove_file(p);
-    true
+    })
 }
 
-fn write_pid_file() -> std::io::Result<()> {
-    let pid = unsafe { libc::getpid() };
-    fs::write(PID_FILE, pid.to_string())
-}
-
-fn clean_pid_file() {
-    let _ = fs::remove_file(PID_FILE);
-}
-
-fn daemonize() -> std::io::Result<()> {
-    unsafe {
-        match libc::fork() {
-            -1 => return Err(std::io::Error::last_os_error()),
-            0 => {}
-            _parent => {
-                std::process::exit(0);
-            }
-        }
-        let sid = libc::setsid();
-        if sid == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-        match libc::fork() {
-            -1 => return Err(std::io::Error::last_os_error()),
-            0 => {}
-            _ => {
-                std::process::exit(0);
-            }
-        }
-        let devnull = libc::open(b"/dev/null\0".as_ptr(), libc::O_RDWR, 0o644);
-        libc::dup2(devnull, libc::STDIN_FILENO as RawFd);
-        libc::dup2(devnull, libc::STDOUT_FILENO as RawFd);
-        libc::dup2(devnull, libc::STDERR_FILENO as RawFd);
-        if devnull > 2 {
-            libc::close(devnull);
-        }
-    }
-    Ok(())
-}
-
-fn is_blacklist_target(comm: &str) -> bool {
-    BLACK_LIST.iter().any(|s| comm.contains(s))
-}
-
-fn get_tid_comm(tid: u32) -> Option<String> {
-    let path = format!("/proc/{tid}/comm");
-    fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim_end().to_string())
-}
-
-fn get_tid_nice(tid: u32) -> Option<i32> {
-    let stat = fs::read_to_string(format!("/proc/{tid}/stat")).ok()?;
-    let parts: Vec<&str> = stat.split_whitespace().collect();
-    parts.get(17)?.parse().ok()
-}
-
-fn set_tid_nice(tid: u32, nice: i32) -> std::io::Result<()> {
-    fs::write(format!("/proc/{tid}/nice"), nice.to_string())
-}
-
-fn read_tid_stat(tid: u32) -> Option<(u64, u64)> {
-    let stat = fs::read_to_string(format!("/proc/{tid}/stat")).ok()?;
-    let parts: Vec<&str> = stat.split_whitespace().collect();
-    let utime: u64 = parts.get(13)?.parse().ok()?;
-    let stime: u64 = parts.get(14)?.parse().ok()?;
-    Some((utime, stime))
-}
-
-fn get_tid_cpu_percent(tid: u32, cache: &mut HashMap<u32, ThreadCpuSample>) -> Option<f32> {
-    let (now_utime, now_stime) = read_tid_stat(tid)?;
-    let now_instant = Instant::now();
-
-    let entry = cache.entry(tid).or_insert(ThreadCpuSample {
-        utime: now_utime,
-        stime: now_stime,
-        sample_time: now_instant,
-    });
-
-    let delta_time_ms = now_instant.duration_since(entry.sample_time).as_millis() as u64;
-    if delta_time_ms < 50 {
-        return None;
-    }
-
-    let delta_utime = now_utime - entry.utime;
-    let delta_stime = now_stime - entry.stime;
-    let total_delta = delta_utime + delta_stime;
-
-    entry.utime = now_utime;
-    entry.stime = now_stime;
-    entry.sample_time = now_instant;
-
-    let ticks_per_ms = 0.1;
-    let cpu_pct = (total_delta as f32 * 100.0) / (delta_time_ms as f32 * ticks_per_ms);
-    Some(cpu_pct.clamp(0.0, 100.0))
-}
-
-fn is_process_alive(pid: u32) -> bool {
-    fs::metadata(format!("/proc/{pid}")).is_ok()
-}
-
-fn scan_game_threads(
-    game_pid: u32,
-    state_map: &mut HashMap<u32, ThreadState>,
-    cpu_cache: &mut HashMap<u32, ThreadCpuSample>,
-) {
-    let task_path = format!("/proc/{game_pid}/task");
-    let dir_entries = match fs::read_dir(task_path) {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-
-    let mut alive_tids = Vec::new();
-
-    const HIGH_THRESHOLD: f32 = 20.0;
-    const SAMPLE_HIGH_TRIGGER: u32 = 3;
-    const SAMPLE_LOW_RECOVER: u32 = 2;
-    const PULSE_WINDOW: u32 = 4;
-    const PULSE_HIGH: u32 = 2;
-
-    for entry in dir_entries.flatten() {
-        let tid_str = match entry.file_name().into_string() {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let tid = match tid_str.parse::<u32>() {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-        alive_tids.push(tid);
-
-        let comm = match get_tid_comm(tid) {
-            Some(c) => c,
-            None => continue,
-        };
-
-        if !is_blacklist_target(&comm) {
-            continue;
-        }
-
-        let state = state_map.entry(tid).or_insert_with(|| {
-            let orig = get_tid_nice(tid).unwrap_or(0);
-            ThreadState {
-                origin_nice: orig,
-                current_nice: orig,
-                target_nice: orig,
-                high_sample_cnt: 0,
-                low_sample_cnt: 0,
-                pulse_cnt: 0,
-                is_limited: false,
-            }
-        });
-
-        if comm.contains("ace") {
-            state.target_nice = std::cmp::min(state.origin_nice + 5, MAX_NICE);
-            state.is_limited = true;
-        } else if comm.starts_with("Thread-") {
-            let cpu = match get_tid_cpu_percent(tid, cpu_cache) {
-                Some(v) => v,
-                None => continue,
-            };
-
-            if cpu > HIGH_THRESHOLD {
-                state.pulse_cnt += 1;
-                state.high_sample_cnt += 1;
-            }
-            if state.pulse_cnt > PULSE_WINDOW {
-                state.pulse_cnt = 0;
-            }
-
-            if state.high_sample_cnt >= SAMPLE_HIGH_TRIGGER {
-                state.target_nice = std::cmp::min(state.origin_nice + 3, MAX_NICE);
-                state.is_limited = true;
-            } else if state.pulse_cnt >= PULSE_HIGH {
-                state.target_nice = std::cmp::min(state.origin_nice + 5, MAX_NICE);
-                state.is_limited = true;
-            } else {
-                state.target_nice = std::cmp::min(state.origin_nice + 1, MAX_NICE);
-                state.is_limited = true;
-            }
-
-            if cpu <= HIGH_THRESHOLD {
-                state.high_sample_cnt = 0;
-                if state.is_limited {
-                    state.low_sample_cnt += 1;
-                    if state.low_sample_cnt >= SAMPLE_LOW_RECOVER {
-                        state.target_nice = state.origin_nice;
-                    }
-                }
-            }
-        }
-
-        if state.current_nice < state.target_nice {
-            state.current_nice += STEP;
-            state.current_nice = state.current_nice.min(MAX_NICE);
-            let _ = set_tid_nice(tid, state.current_nice);
-        } else if state.current_nice > state.target_nice {
-            state.current_nice -= STEP;
-            let _ = set_tid_nice(tid, state.current_nice);
-            if state.current_nice == state.origin_nice {
-                state.is_limited = false;
-                state.low_sample_cnt = 0;
-                state.pulse_cnt = 0;
-            }
-        }
-    }
-
-    state_map.retain(|tid, _| alive_tids.contains(tid));
-    cpu_cache.retain(|tid, _| alive_tids.contains(tid));
-}
-
-fn restore_all_threads(state_map: &mut HashMap<u32, ThreadState>) {
-    for (tid, state) in state_map.iter_mut() {
-        state.current_nice = state.origin_nice;
-        state.target_nice = state.origin_nice;
-        let _ = set_tid_nice(*tid, state.origin_nice);
-    }
-    state_map.clear();
-}
-
-fn find_game_pid(pkg: &str) -> Option<u32> {
+fn get_game_pid() -> Option<u32> {
     let dir = fs::read_dir("/proc").ok()?;
     for entry in dir.flatten() {
-        let filename = entry.file_name();
-        let pid_str = match filename.into_string() {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let pid: u32 = match pid_str.parse() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let cmdline_path = format!("/proc/{pid}/cmdline");
-        let cmdline = match fs::read(cmdline_path) {
-            Ok(buf) => buf,
-            Err(_) => continue,
-        };
-        let cmd_str = String::from_utf8_lossy(&cmdline);
-        if cmd_str.contains(pkg) {
-            return Some(pid);
+        let fname = entry.file_name();
+        let pid_str = fname.to_string_lossy();
+        if let Ok(pid) = pid_str.parse::<u32>() {
+            let cmdline = fs::read_to_string(format!("/proc/{pid}/cmdline")).ok()?;
+            if cmdline.contains(GAME_PKG) {
+                return Some(pid);
+            }
         }
     }
     None
 }
 
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
-    // 第一步：单实例检查
-    if !check_single_instance() {
-        std::process::exit(1);
+fn get_all_tid(pid: u32) -> Vec<u32> {
+    let mut tids = Vec::new();
+    let dir = fs::read_dir(format!("/proc/{pid}/task")).ok()?;
+    for entry in dir.flatten() {
+        let tid_name = entry.file_name();
+        if let Ok(tid) = tid_name.to_string_lossy().parse::<u32>() {
+            tids.push(tid);
+        }
     }
+    tids
+}
 
-    // 环境变量 DFM_FOREGROUND=1 前台调试，不走daemon
-    let foreground = std::env::var("DFM_FOREGROUND").is_ok();
-    if !foreground {
-        daemonize()?;
-    }
+fn read_tid_stat(tid: u32) -> Option<(u64, String, i32)> {
+    let stat_raw = fs::read_to_string(format!("/proc/{tid}/stat")).ok()?;
+    let mut parts = stat_raw.split_whitespace();
+    let comm = parts.nth(1)?.trim_start_matches('(').trim_end_matches(')').to_string();
+    let utime: u64 = parts.nth(11)?.parse().ok()?;
+    let stime: u64 = parts.next()?.parse().ok()?;
+    let nice: i32 = parts.nth(2)?.parse().ok()?;
+    Some((utime + stime, comm, nice))
+}
 
-    write_pid_file()?;
+fn set_tid_nice(tid: u32, nice_val: i32) -> bool {
+    fs::write(format!("/proc/{tid}/nice"), format!("{}", nice_val)).is_ok()
+}
 
-    let mut thread_state = HashMap::new();
-    let mut cpu_sample_cache = HashMap::new();
+fn main() {
+    let mut signals = Signals::new(&[SIGINT, SIGTERM]).unwrap();
+    let mut thread_map: HashMap<u32, ThreadState> = HashMap::new();
+    let sample_count = (WINDOW_SEC * 1000 / SAMPLE_INTERVAL_MS) as usize;
+    let mut restore_list: Vec<(u32, i32)> = Vec::new();
 
-    let mut sigint = signal(SignalKind::interrupt())?;
+    std::thread::spawn(move || {
+        for _ in signals.forever() {
+            for (tid, old_nice) in restore_list.iter() {
+                let _ = set_tid_nice(*tid, *old_nice);
+            }
+            std::process::exit(0);
+        }
+    });
 
-    let res: std::io::Result<()> = async {
-        loop {
-            let game_pid = loop {
-                match find_game_pid(GAME_PACKAGE) {
-                    Some(pid) => {
-                        if foreground {
-                            println!("Detect game start, pid={pid}");
-                        }
-                        break pid;
-                    }
-                    None => sleep(Duration::from_secs(1)).await,
+    loop {
+        let Some(game_pid) = get_game_pid() else {
+            thread::sleep(Duration::from_millis(SAMPLE_INTERVAL_MS));
+            thread_map.clear();
+            continue;
+        };
+
+        let tids = get_all_tid(game_pid);
+        let mut new_thread_map = HashMap::new();
+
+        for tid in tids {
+            let Some((cpu_total, comm, current_nice)) = read_tid_stat(tid) else {continue;};
+            if is_whitelist(&comm) { continue; }
+            if !is_blacklist(&comm) { continue; }
+
+            let entry = thread_map.entry(tid).or_insert(ThreadState {
+                cpu_samples: Vec::with_capacity(sample_count),
+                original_nice: Some(current_nice),
+            });
+            entry.cpu_samples.push(cpu_total);
+            if entry.cpu_samples.len() > sample_count {
+                entry.cpu_samples.remove(0);
+            }
+            new_thread_map.insert(tid, entry.clone());
+
+            // 瞬时负载计算
+            if entry.cpu_samples.len() >=2 {
+                let delta_cpu = entry.cpu_samples.last().unwrap() - entry.cpu_samples[entry.cpu_samples.len()-2];
+                let instant_cpu = delta_cpu as f32 *100.0 / (SAMPLE_INTERVAL_MS as f32 * 10.0);
+                let mut trigger = false;
+
+                // 瞬时爆发触发
+                if instant_cpu > BURST_INSTANT_THRESHOLD {
+                    trigger = true;
                 }
-            };
-            let mut tick = interval(Duration::from_millis(500));
-            loop {
-                tokio::select! {
-                    _ = sigint.recv() => {
-                        restore_all_threads(&mut thread_state);
-                        return Ok(());
+                // 3秒平均负载触发
+                if entry.cpu_samples.len() >= sample_count {
+                    let avg_delta = entry.cpu_samples.last().unwrap() - entry.cpu_samples[0];
+                    let avg_cpu = avg_delta as f32 *100.0 / ((WINDOW_SEC *1000) as f32 *10.0);
+                    if avg_cpu > AVG_CPU_THRESHOLD {
+                        trigger = true;
                     }
-                    _ = tick.tick() => {
-                        if !is_process_alive(game_pid) {
-                            if foreground {
-                                println!("Game exited, restore threads, back waiting");
+                }
+
+                if trigger && current_nice < TARGET_NICE {
+                    if set_tid_nice(tid, TARGET_NICE) {
+                        if let Some(old) = entry.original_nice {
+                            if !restore_list.iter().any(|(t,_)| *t == tid) {
+                                restore_list.push((tid, old));
                             }
-                            restore_all_threads(&mut thread_state);
-                            break;
                         }
-                        scan_game_threads(game_pid, &mut thread_state, &mut cpu_sample_cache);
                     }
                 }
             }
         }
-    }.await;
-
-    restore_all_threads(&mut thread_state);
-    clean_pid_file();
-    res
+        thread_map = new_thread_map;
+        thread::sleep(Duration::from_millis(SAMPLE_INTERVAL_MS));
+    }
 }
