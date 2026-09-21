@@ -3,6 +3,7 @@ pre-build = [
     "apt-get update -y",
     "apt-get install -y --no-install-recommends libc6-dev gcc make binutils-aarch64-linux-gnu"
 ]
+runner = false
 
 [env]
 RUSTFLAGS = """
