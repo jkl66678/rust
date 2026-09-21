@@ -6,7 +6,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -24,7 +24,7 @@ jobs:
       - name: Cross build release
         run: cross build --release --target aarch64-unknown-linux-musl
 
-      # 第一层：strip，现在binutils已经提前装好
+      # 第一层：strip
       - name: Strip inside cross container
         run: |
           aarch64-linux-gnu-strip --strip-all target/aarch64-unknown-linux-musl/release/anr_tool
@@ -41,6 +41,13 @@ jobs:
       # 第三层：再次全量strip收尾
       - name: Final full strip
         run: aarch64-linux-gnu-strip --strip-all target/aarch64-unknown-linux-musl/release/anr_tool
+
+      # 新增：校验二进制是否存在、是否合法ELF
+      - name: Check binary file
+        run: |
+          BIN=target/aarch64-unknown-linux-musl/release/anr_tool
+          ls -lh $BIN
+          file $BIN
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
