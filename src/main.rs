@@ -3,6 +3,7 @@ use std::fs;
 use std::os::unix::io::RawFd;
 use std::path::Path;
 use std::time::{Duration, Instant};
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::{interval, sleep};
 
 const PID_FILE: &str = "/data/adb/dfm-daemon.pid";
@@ -73,7 +74,7 @@ fn daemonize() -> std::io::Result<()> {
         match libc::fork() {
             -1 => return Err(std::io::Error::last_os_error()),
             0 => {}
-            parent => {
+            _parent => {
                 std::process::exit(0);
             }
         }
@@ -311,7 +312,7 @@ async fn main() -> std::io::Result<()> {
         std::process::exit(1);
     }
 
-    // 环境变量 DFM_FOREGROUND=1 前台调试，不daemon
+    // 环境变量 DFM_FOREGROUND=1 前台调试，不走daemon
     let foreground = std::env::var("DFM_FOREGROUND").is_ok();
     if !foreground {
         daemonize()?;
@@ -319,13 +320,10 @@ async fn main() -> std::io::Result<()> {
 
     write_pid_file()?;
 
-    use tokio::signal;
     let mut thread_state = HashMap::new();
     let mut cpu_sample_cache = HashMap::new();
 
-    let sig_task = tokio::spawn(async move {
-        signal::signal(signal::unix::SignalKind::interrupt()).unwrap().recv().await;
-    });
+    let mut sigint = signal(SignalKind::interrupt())?;
 
     let res: std::io::Result<()> = async {
         loop {
@@ -343,7 +341,7 @@ async fn main() -> std::io::Result<()> {
             let mut tick = interval(Duration::from_millis(500));
             loop {
                 tokio::select! {
-                    _ = &sig_task => {
+                    _ = sigint.recv() => {
                         restore_all_threads(&mut thread_state);
                         return Ok(());
                     }
