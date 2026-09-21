@@ -16,19 +16,18 @@ strip = "symbols"           # 编译阶段自动剥离符号
 debug = false
 debug-assertions = false
 overflow-checks = false
-# 强制禁用内置源码路径字符串
-remap-path-prefix = { "." = "" }
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
-rayon = "1.10"
+clap = { version = "4.6", features = ["derive"] }
+rayon = "1.12"
 anyhow = "1.0"
 log = "0.4"
 env_logger = "0.11"
 filetime = "0.2"
 walkdir = "2.5"
 chrono = "0.4"
-nix = { version = "0.29", features = ["process", "signal"] }
-signal-hook = "0.3"
-ctrlc = "3.4"
+nix = { version = "0.31", features = ["process", "signal"] }
+signal-hook = "0.4"
+ctrlc = "3.5"
 libc = "0.2"
+regex = "1.13"
