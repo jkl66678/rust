@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
 use std::thread;
 use std::time::Duration;
 use signal_hook::{consts::SIGINT, consts::SIGTERM, iterator::Signals};
@@ -18,7 +17,7 @@ const WHITELIST: [&str; 2] = ["GameThread", "RenderThread"];
 // 黑名单：需要监控的后台线程
 const BLACKLIST: [&str;4] = ["Thread-", "ace", "NativeThread", "TaskGraphNP 0"];
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ThreadState {
     cpu_samples: Vec<u64>,
     original_nice: Option<i32>,
@@ -56,12 +55,16 @@ fn get_game_pid() -> Option<u32> {
 
 fn get_all_tid(pid: u32) -> Vec<u32> {
     let mut tids = Vec::new();
-    let dir = fs::read_dir(format!("/proc/{pid}/task")).ok()?;
-    for entry in dir.flatten() {
-        let tid_name = entry.file_name();
-        if let Ok(tid) = tid_name.to_string_lossy().parse::<u32>() {
-            tids.push(tid);
+    match fs::read_dir(format!("/proc/{pid}/task")) {
+        Ok(dir) => {
+            for entry in dir.flatten() {
+                let tid_name = entry.file_name();
+                if let Ok(tid) = tid_name.to_string_lossy().parse::<u32>() {
+                    tids.push(tid);
+                }
+            }
         }
+        Err(_) => {}
     }
     tids
 }
