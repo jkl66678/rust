@@ -15,26 +15,29 @@ jobs:
         with:
           targets: aarch64-unknown-linux-musl
 
-      - name: Install cross
-        run: cargo install cross
+      - name: Install cross + aarch64交叉binutils
+        run: |
+          cargo install cross
+          sudo apt update -y
+          sudo apt install binutils-aarch64-linux-gnu binutils-aarch64-linux-musl -y
 
       - name: Cross build release
         run: cross build --release --target aarch64-unknown-linux-musl
 
-      # 第一层：容器内架构专用strip
-      - name: Strip inside cross container
+      # 第一层：宿主机musl-strip（移除cross run，不再qemu模拟）
+      - name: Strip binary (musl)
         run: |
-          cross run --target aarch64-unknown-linux-musl -- \
-            aarch64-linux-musl-strip --strip-all target/aarch64-unknown-linux-musl/release/anr_tool
+          aarch64-linux-musl-strip --strip-all target/aarch64-unknown-linux-musl/release/anr_tool
 
       # 第二层：主机objcopy深度删除ELF特征段
       - name: Deep ELF feature section wipe
         run: |
-          sudo apt install binutils-aarch64-linux-gnu -y
           aarch64-linux-gnu-objcopy \
             --remove-section=.rodata.cst16 \
             --remove-section=.symtab \
             --remove-section=.strtab \
+            --remove-section=.comment \
+            --remove-section=.note \
             target/aarch64-unknown-linux-musl/release/anr_tool
 
       # 第三层：再次全量strip收尾
