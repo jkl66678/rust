@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
+use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -15,7 +16,7 @@ const AVG_CPU_THRESHOLD: f32 = 3.5;
 const BURST_INSTANT_THRESHOLD: f32 = 25.0;
 const TARGET_NICE: i32 = 19;
 const GAME_PKG: &str = "com.tencent.tmgp.dfm";
-const BIN_NAME: &[u8] = b"dfm-daemon";
+const PID_FILE: &str = "/data/adb/dfm-daemon.pid";
 
 #[derive(Debug, Default)]
 struct ThreadCpuSample {
@@ -153,27 +154,6 @@ fn get_all_tid(pid: u32) -> Vec<u32> {
     tids
 }
 
-fn single_instance_check() -> bool {
-    let dir = match fs::read_dir("/proc").ok() {
-        Some(d) => d,
-        None => return true,
-    };
-    for entry in dir.flatten() {
-        let fname = entry.file_name();
-        let pid_str = fname.to_str();
-        let Some(pid_str) = pid_str else { continue };
-        if !pid_str.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        let cmd_path = format!("/proc/{pid_str}/cmdline");
-        let Ok(cmd) = fs::read(cmd_path) else { continue };
-        if cmd.windows(BIN_NAME.len()).any(|w| w == BIN_NAME) {
-            return false;
-        }
-    }
-    true
-}
-
 fn restore_all(restore_list: &mut Vec<(u32, i32)>) {
     for (tid, old_nice) in &mut *restore_list {
         let _ = set_tid_nice(*tid, *old_nice);
@@ -181,12 +161,51 @@ fn restore_all(restore_list: &mut Vec<(u32, i32)>) {
     restore_list.clear();
 }
 
-fn main() -> io::Result<()> {
-    if !single_instance_check() {
-        eprintln!("daemon already running");
-        std::process::exit(1);
+fn pid_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// 检查pid文件，活着直接退出，死了删除旧pid
+fn check_pidfile() -> io::Result<()> {
+    if Path::new(PID_FILE).exists() {
+        let content = fs::read_to_string(PID_FILE)?;
+        match content.trim().parse::<u32>() {
+            Ok(old_pid) if pid_alive(old_pid) => {
+                eprintln!("daemon already running, pid={old_pid}");
+                std::process::exit(1);
+            }
+            _ => {
+                let _ = fs::remove_file(PID_FILE);
+            }
+        }
     }
+    Ok(())
+}
+
+/// 写入当前进程pid到pidfile
+fn write_pidfile() -> io::Result<()> {
+    let pid = unsafe { libc::getpid() as u32 };
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(PID_FILE)?;
+    writeln!(f, "{pid}")?;
+    Ok(())
+}
+
+fn remove_pidfile() {
+    let _ = fs::remove_file(PID_FILE);
+}
+
+fn main() -> io::Result<()> {
+    // pid文件检测，替换原来single_instance_check
+    check_pidfile()?;
+
     daemonize()?;
+
+    // 双fork之后pid已经改变，写入真实子进程pid
+    write_pidfile()?;
 
     let restore_list: Arc<Mutex<Vec<(u32, i32)>>> = Arc::new(Mutex::new(Vec::new()));
     let rl_clone = Arc::clone(&restore_list);
@@ -194,6 +213,7 @@ fn main() -> io::Result<()> {
     thread::spawn(move || {
         let mut signals = Signals::new(&[SIGINT, SIGTERM]).unwrap();
         for _ in signals.forever() {
+            remove_pidfile();
             let mut guard = rl_clone.lock().unwrap();
             restore_all(&mut guard);
             std::process::exit(0);
