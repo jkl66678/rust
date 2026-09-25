@@ -26,7 +26,7 @@ env_logger = "0.11"
 filetime = "0.2"
 walkdir = "2.5"
 chrono = "0.4"
-nix = { version = "0.31", features = ["fs", "process", "signal", "resource"] }
+nix = { version = "0.29", features = ["fs", "process", "signal", "resource"] }
 signal-hook = "0.4"
 ctrlc = "3.5"
 libc = "0.2"
