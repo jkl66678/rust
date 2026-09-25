@@ -2,13 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Read};
-use std::os::fd::AsFd;
+use std::os::unix::io::AsRawFd;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use nix::unistd::{fork, ForkResult, setsid, dup2_stdin, dup2_stdout, dup2_stderr};
-use nix::libc::{setpriority, getpriority, PRIO_PROCESS};
+use nix::unistd::{fork, ForkResult, setsid, dup2};
+use nix::sys::resource::{getpriority, setpriority, PrioWhich};
 use signal_hook::{consts::{SIGINT, SIGTERM}, iterator::Signals};
 
 // ========== 配置区 ==========
@@ -34,42 +34,35 @@ struct ThreadState {
     adjusted: bool,
 }
 
-// nix0.31 高层api移除，直接调用nix::libc，0unsafe
 fn set_thread_nice(tid: u32, nice: i32) -> bool {
-    unsafe { setpriority(PRIO_PROCESS, tid as i32, nice) == 0 }
+    setpriority(PrioWhich::Process(tid as i32), nice).is_ok()
 }
 
 fn get_thread_nice(tid: u32) -> Option<i32> {
-    let ret = unsafe { getpriority(PRIO_PROCESS, tid as i32) };
-    // getpriority返回-1既可能是错误，也可能nice=-20；简单方案：忽略errno，root环境安卓够用
-    Some(ret)
+    getpriority(PrioWhich::Process(tid as i32)).ok()
 }
 
-// 内置完整双 fork + setsid daemon，0 unsafe
+// 双fork + setsid 守护进程
 fn daemonize_self() {
-    // 第一次 fork：脱离终端
     match fork() {
         Ok(ForkResult::Child) => {}
         Ok(ForkResult::Parent { .. }) => std::process::exit(0),
         Err(_) => return,
     }
 
-    // 创建新会话，脱离控制终端
     let _ = setsid();
 
-    // 第二次 fork：禁止重新获取控制终端
     match fork() {
         Ok(ForkResult::Child) => {}
         Ok(ForkResult::Parent { .. }) => std::process::exit(0),
         Err(_) => return,
     }
 
-    // 重定向 stdin/stdout/stderr 到 /dev/null，使用nix内置dup2_*
     if let Ok(devnull) = OpenOptions::new().read(true).write(true).open("/dev/null") {
-        let fd = devnull.as_fd();
-        let _ = dup2_stdin(fd);
-        let _ = dup2_stdout(fd);
-        let _ = dup2_stderr(fd);
+        let fd = devnull.as_raw_fd();
+        let _ = dup2(fd, 0);
+        let _ = dup2(fd, 1);
+        let _ = dup2(fd, 2);
     }
 }
 
@@ -191,7 +184,6 @@ fn single_instance_check() -> bool {
                 break;
             }
         }
-        // ppid == 1 说明是已守护的后台实例
         if ppid_opt == Some(1) {
             return false;
         }
@@ -262,7 +254,6 @@ fn main() -> io::Result<()> {
             tids_buf.push(tid);
         }
 
-        // 每轮清理死亡 TID，防止内存上涨
         let alive_set: HashSet<u32> = HashSet::from_iter(tids_buf.iter().copied());
         let mut dead_tids = Vec::new();
         for tid in thread_state_map.keys() {
