@@ -5,7 +5,10 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use nix::unistd::{setsid, fork, ForkResult};
+use nix::unistd::{setsid, fork, ForkResult, dup2, getpriority, setpriority, PrioWhich};
+use nix::fcntl::open;
+use nix::fcntl::O_RDWR;
+use nix::sys::stat::Mode;
 use signal_hook::{consts::{SIGINT, SIGTERM}, iterator::Signals};
 
 // ========== 配置区 ==========
@@ -31,75 +34,6 @@ struct ThreadState {
     adjusted: bool,
 }
 
-fn u32_to_buf(mut v: u32, buf: &mut [u8]) -> usize {
-    let mut pos = 0;
-    if v == 0 {
-        buf[0] = b'0';
-        return 1;
-    }
-    let mut tmp = [0u8;16];
-    let mut t = 0;
-    while v > 0 {
-        tmp[t] = (v % 10) as u8 + b'0';
-        v /=10;
-        t +=1;
-    }
-    while t>0 {
-        t -=1;
-        buf[pos] = tmp[t];
-        pos +=1;
-    }
-    pos
-}
-
-fn build_proc_tid_stat(tid: u32, buf: &mut [u8;64]) -> &[u8] {
-    let prefix = b"/proc/";
-    buf[0..prefix.len()].copy_from_slice(prefix);
-    let mut off = prefix.len();
-    let len = u32_to_buf(tid, &mut buf[off..]);
-    off += len;
-    let suffix = b"/stat";
-    buf[off..off+suffix.len()].copy_from_slice(suffix);
-    off += suffix.len();
-    &buf[0..off]
-}
-
-fn build_proc_task(pid: u32, buf: &mut [u8;64]) -> &[u8] {
-    let prefix = b"/proc/";
-    buf[0..prefix.len()].copy_from_slice(prefix);
-    let mut off = prefix.len();
-    let len = u32_to_buf(pid, &mut buf[off..]);
-    off += len;
-    let suffix = b"/task";
-    buf[off..off+suffix.len()].copy_from_slice(suffix);
-    off += suffix.len();
-    &buf[0..off]
-}
-
-fn build_proc_cmdline(pid: u32, buf: &mut [u8;64]) -> &[u8] {
-    let prefix = b"/proc/";
-    buf[0..prefix.len()].copy_from_slice(prefix);
-    let mut off = prefix.len();
-    let len = u32_to_buf(pid, &mut buf[off..]);
-    off += len;
-    let suffix = b"/cmdline";
-    buf[off..off+suffix.len()].copy_from_slice(suffix);
-    off += suffix.len();
-    &buf[0..off]
-}
-
-fn build_proc_stat(pid: u32, buf: &mut [u8;64]) -> &[u8] {
-    let prefix = b"/proc/";
-    buf[0..prefix.len()].copy_from_slice(prefix);
-    let mut off = prefix.len();
-    let len = u32_to_buf(pid, &mut buf[off..]);
-    off += len;
-    let suffix = b"/stat";
-    buf[off..off+suffix.len()].copy_from_slice(suffix);
-    off += suffix.len();
-    &buf[0..off]
-}
-
 fn get_pid_via_pidof(pkg: &str) -> Option<u32> {
     let out = Command::new("pidof").arg("-s").arg(pkg).output();
     match out {
@@ -116,7 +50,6 @@ fn get_pid_by_proc_scan(pkg: &str) -> Option<u32> {
         Ok(d) => d,
         Err(_) => return None,
     };
-    let mut path_buf = [0u8;64];
     let mut buf = [0u8;512];
     for entry in dir_iter.flatten() {
         let name = entry.file_name();
@@ -125,7 +58,7 @@ fn get_pid_by_proc_scan(pkg: &str) -> Option<u32> {
             _ => continue,
         };
         let pid = pid_str.parse::<u32>().ok()?;
-        let proc_path = build_proc_cmdline(pid, &mut path_buf);
+        let proc_path = format!("/proc/{pid}/cmdline");
         let mut f = match fs::File::open(proc_path) { Ok(f)=>f, Err(_)=>continue };
         let n = f.read(&mut buf).unwrap_or(0);
         let cmdline = &buf[0..n];
@@ -141,13 +74,12 @@ fn find_game_pid() -> Option<u32> {
 }
 
 fn read_tid_stat(tid: u32) -> Option<(u64,u64)> {
-    let mut path_buf = [0u8;64];
-    let stat_path = build_proc_tid_stat(tid, &mut path_buf);
+    let stat_path = format!("/proc/{tid}/stat");
     let mut stack_buf = [0u8;1024];
     let mut fd = fs::File::open(stat_path).ok()?;
     let read_len = fd.read(&mut stack_buf).ok()?;
     if read_len == 0 { return None; }
-    let content = unsafe { std::str::from_utf8_unchecked(&stack_buf[0..read_len]) };
+    let content = std::str::from_utf8(&stack_buf[0..read_len]).ok()?;
 
     let mut tokens = content.split_whitespace();
     let mut idx = 0usize;
@@ -166,7 +98,11 @@ fn read_tid_stat(tid: u32) -> Option<(u64,u64)> {
 }
 
 fn set_thread_nice(tid: u32, nice: i32) -> bool {
-    unsafe { libc::setpriority(libc::PRIO_PROCESS, tid, nice) == 0 }
+    setpriority(PrioWhich::Process(tid as i32), nice).is_ok()
+}
+
+fn get_thread_nice(tid: u32) -> Option<i32> {
+    getpriority(PrioWhich::Process(tid as i32)).ok()
 }
 
 fn daemonize_self() {
@@ -175,17 +111,17 @@ fn daemonize_self() {
         Ok(ForkResult::Parent{..}) => std::process::exit(0),
         Err(_) => return,
     }
-    setsid().ok();
+    let _ = setsid();
     match fork() {
         Ok(ForkResult::Child) => {},
         Ok(ForkResult::Parent{..}) => std::process::exit(0),
         Err(_) => return,
     }
-    let null = std::fs::File::open("/dev/null").unwrap();
-    let _ = std::io::stdin().take();
-    let _ = std::io::stdout().take();
-    let _ = std::io::stderr().take();
-    std::mem::forget(null);
+    if let Ok(devnull) = open("/dev/null", O_RDWR, Mode::empty()) {
+        let _ = dup2(devnull, 0);
+        let _ = dup2(devnull, 1);
+        let _ = dup2(devnull, 2);
+    }
 }
 
 fn single_instance_check() -> bool {
@@ -193,7 +129,6 @@ fn single_instance_check() -> bool {
         Ok(d) => d,
         Err(_) => return true,
     };
-    let mut path_buf = [0u8;64];
     let mut read_buf = [0u8;1024];
 
     for entry in dir_iter.flatten() {
@@ -204,17 +139,17 @@ fn single_instance_check() -> bool {
         };
         let pid = match pid_str.parse::<u32>() {Ok(p)=>p,Err(_)=>continue};
 
-        let cmd_path = build_proc_cmdline(pid, &mut path_buf);
+        let cmd_path = format!("/proc/{pid}/cmdline");
         let mut f = match fs::File::open(cmd_path) {Ok(f)=>f,Err(_)=>continue};
         let n = f.read(&mut read_buf).unwrap_or(0);
         if !read_buf[0..n].windows(BIN_NAME.len()).any(|w| w == BIN_NAME) {
             continue;
         }
 
-        let stat_path = build_proc_stat(pid, &mut path_buf);
+        let stat_path = format!("/proc/{pid}/stat");
         let mut sf = match fs::File::open(stat_path) {Ok(f)=>f,Err(_)=>continue};
         let rn = sf.read(&mut read_buf).unwrap_or(0);
-        let s = unsafe { std::str::from_utf8_unchecked(&read_buf[0..rn]) };
+        let s = match std::str::from_utf8(&read_buf[0..rn]) {Ok(v)=>v,Err(_)=>continue};
         let mut t = s.split_whitespace();
         let mut idx = 0;
         let mut ppid_opt:Option<u32> = None;
@@ -264,7 +199,6 @@ fn main() -> io::Result<()> {
 
     loop {
         let Some(game_pid) = find_game_pid() else {
-            // 游戏消失立刻还原全部，清理缓存
             let mut guard = restore_list.lock().unwrap();
             restore_all(&mut guard);
             thread_state_map.clear();
@@ -274,16 +208,38 @@ fn main() -> io::Result<()> {
         };
 
         tids_buf.clear();
-        {
-            let mut buf = [0u8;64];
-            let task_path = build_proc_task(game_pid, &mut buf);
-            let dir_iter = match fs::read_dir(task_path) { Ok(d)=>d, Err(_)=>{ thread::sleep(Duration::from_millis(SAMPLE_INTERVAL_MS)); continue; } };
-            for e in dir_iter.flatten() {
-                let fname = e.file_name();
-                let s = match fname.to_str() { Some(v)=>v, None=>continue };
-                let tid = match s.parse::<u32>() { Ok(v)=>v, Err(_)=>continue };
-                tids_buf.push(tid);
+        let task_path = format!("/proc/{game_pid}/task");
+        let dir_iter = match fs::read_dir(task_path) {
+            Ok(d)=>d,
+            Err(_)=>{
+                thread::sleep(Duration::from_millis(SAMPLE_INTERVAL_MS));
+                continue;
             }
+        };
+        for e in dir_iter.flatten() {
+            let fname = e.file_name();
+            let s = match fname.to_str() { Some(v)=>v, None=>continue };
+            let tid = match s.parse::<u32>() { Ok(v)=>v, Err(_)=>continue };
+            tids_buf.push(tid);
+        }
+
+        // ========== 每轮清理死亡TID ==========
+        let alive_set = std::collections::HashSet::from_iter(tids_buf.iter().copied());
+        let mut dead_tids = Vec::new();
+        for tid in thread_state_map.keys() {
+            if !alive_set.contains(tid) {
+                dead_tids.push(*tid);
+            }
+        }
+        for tid in dead_tids {
+            if let Some(state) = thread_state_map.remove(&tid) {
+                if state.adjusted {
+                    let mut g = restore_list.lock().unwrap();
+                    g.retain(|&(t,_)| t != tid);
+                    // 线程已消亡，不必调用set_thread_nice
+                }
+            }
+            cpu_history.remove(&tid);
         }
 
         for &tid in tids_buf.iter() {
@@ -310,11 +266,12 @@ fn main() -> io::Result<()> {
             let state = thread_state_map.entry(tid).or_insert(ThreadState{orig_nice:0, adjusted:false});
 
             if (avg_cpu_pct > AVG_CPU_THRESHOLD || instant_pct > BURST_INSTANT_THRESHOLD) && !state.adjusted {
-                let cur_nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, tid) };
-                state.orig_nice = cur_nice;
-                state.adjusted = true;
-                restore_list.lock().unwrap().push((tid,cur_nice));
-                set_thread_nice(tid, MAX_NICE);
+                if let Some(cur_nice) = get_thread_nice(tid) {
+                    state.orig_nice = cur_nice;
+                    state.adjusted = true;
+                    restore_list.lock().unwrap().push((tid,cur_nice));
+                    set_thread_nice(tid, MAX_NICE);
+                }
             }
         }
 
