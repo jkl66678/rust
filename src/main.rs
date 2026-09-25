@@ -1,14 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use nix::unistd::{setsid, fork, ForkResult, dup2, getpriority, setpriority, PrioWhich};
-use nix::fcntl::open;
-use nix::fcntl::O_RDWR;
+use nix::unistd::{setsid, fork, ForkResult};
+use nix::fs::{open, O_RDWR};
 use nix::sys::stat::Mode;
+use nix::unistd::dup2;
+use nix::priority::{getpriority, setpriority, PrioWhich};
 use signal_hook::{consts::{SIGINT, SIGTERM}, iterator::Signals};
 
 // ========== 配置区 ==========
@@ -81,7 +82,7 @@ fn read_tid_stat(tid: u32) -> Option<(u64,u64)> {
     if read_len == 0 { return None; }
     let content = std::str::from_utf8(&stack_buf[0..read_len]).ok()?;
 
-    let mut tokens = content.split_whitespace();
+    let tokens = content.split_whitespace();
     let mut idx = 0usize;
     let mut utime:Option<u64> = None;
     let mut stime:Option<u64> = None;
@@ -118,9 +119,9 @@ fn daemonize_self() {
         Err(_) => return,
     }
     if let Ok(devnull) = open("/dev/null", O_RDWR, Mode::empty()) {
-        let _ = dup2(devnull, 0);
-        let _ = dup2(devnull, 1);
-        let _ = dup2(devnull, 2);
+        let _ = dup2(&devnull, &mut std::io::stdin());
+        let _ = dup2(&devnull, &mut std::io::stdout());
+        let _ = dup2(&devnull, &mut std::io::stderr());
     }
 }
 
@@ -150,7 +151,7 @@ fn single_instance_check() -> bool {
         let mut sf = match fs::File::open(stat_path) {Ok(f)=>f,Err(_)=>continue};
         let rn = sf.read(&mut read_buf).unwrap_or(0);
         let s = match std::str::from_utf8(&read_buf[0..rn]) {Ok(v)=>v,Err(_)=>continue};
-        let mut t = s.split_whitespace();
+        let t = s.split_whitespace();
         let mut idx = 0;
         let mut ppid_opt:Option<u32> = None;
         for token in t {
@@ -223,8 +224,8 @@ fn main() -> io::Result<()> {
             tids_buf.push(tid);
         }
 
-        // ========== 每轮清理死亡TID ==========
-        let alive_set = std::collections::HashSet::from_iter(tids_buf.iter().copied());
+        // 每轮清理死亡TID，防止内存上涨
+        let alive_set:HashSet<u32> = HashSet::from_iter(tids_buf.iter().copied());
         let mut dead_tids = Vec::new();
         for tid in thread_state_map.keys() {
             if !alive_set.contains(tid) {
@@ -236,7 +237,6 @@ fn main() -> io::Result<()> {
                 if state.adjusted {
                     let mut g = restore_list.lock().unwrap();
                     g.retain(|&(t,_)| t != tid);
-                    // 线程已消亡，不必调用set_thread_nice
                 }
             }
             cpu_history.remove(&tid);
