@@ -5,10 +5,10 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use nix::unistd::{setsid, fork, ForkResult};
-use nix::fs::{open, O_RDWR};
+use nix::unistd::{fork, ForkResult, setsid, dup2, close};
+use nix::fs::open;
+use nix::fcntl::OFlag;
 use nix::sys::stat::Mode;
-use nix::unistd::dup2;
 use nix::priority::{getpriority, setpriority, PrioWhich};
 use signal_hook::{consts::{SIGINT, SIGTERM}, iterator::Signals};
 
@@ -21,7 +21,7 @@ const MAX_NICE: i32 = 19;
 const GAME_PKG: &str = "com.tencent.tmgp.dfm";
 const BIN_NAME: &[u8] = b"dfm-daemon";
 
-#[derive(Debug,Default)]
+#[derive(Debug, Default)]
 struct ThreadCpuSample {
     prev_utime: u64,
     prev_stime: u64,
@@ -29,10 +29,47 @@ struct ThreadCpuSample {
     sample_cnt: u64,
 }
 
-#[derive(Debug,Copy,Clone)]
+#[derive(Debug, Copy, Clone)]
 struct ThreadState {
     orig_nice: i32,
     adjusted: bool,
+}
+
+// 全部 nix 安全封装，0 unsafe
+fn set_thread_nice(tid: u32, nice: i32) -> bool {
+    setpriority(PrioWhich::Process(tid as i32), nice).is_ok()
+}
+
+fn get_thread_nice(tid: u32) -> Option<i32> {
+    getpriority(PrioWhich::Process(tid as i32)).ok()
+}
+
+// 内置完整双 fork + setsid daemon，0 unsafe
+fn daemonize_self() {
+    // 第一次 fork：脱离终端
+    match fork() {
+        Ok(ForkResult::Child) => {}
+        Ok(ForkResult::Parent { .. }) => std::process::exit(0),
+        Err(_) => return,
+    }
+
+    // 创建新会话，脱离控制终端
+    let _ = setsid();
+
+    // 第二次 fork：禁止重新获取控制终端
+    match fork() {
+        Ok(ForkResult::Child) => {}
+        Ok(ForkResult::Parent { .. }) => std::process::exit(0),
+        Err(_) => return,
+    }
+
+    // 重定向 stdin/stdout/stderr 到 /dev/null
+    if let Ok(devnull) = open("/dev/null", OFlag::O_RDWR, Mode::empty()) {
+        let _ = dup2(devnull, 0);
+        let _ = dup2(devnull, 1);
+        let _ = dup2(devnull, 2);
+        let _ = close(devnull);
+    }
 }
 
 fn get_pid_via_pidof(pkg: &str) -> Option<u32> {
@@ -42,7 +79,7 @@ fn get_pid_via_pidof(pkg: &str) -> Option<u32> {
             let s = String::from_utf8_lossy(&o.stdout);
             s.trim().parse::<u32>().ok()
         }
-        _ => None
+        _ => None,
     }
 }
 
@@ -51,7 +88,7 @@ fn get_pid_by_proc_scan(pkg: &str) -> Option<u32> {
         Ok(d) => d,
         Err(_) => return None,
     };
-    let mut buf = [0u8;512];
+    let mut buf = [0u8; 512];
     for entry in dir_iter.flatten() {
         let name = entry.file_name();
         let pid_str = match name.to_str() {
@@ -60,7 +97,10 @@ fn get_pid_by_proc_scan(pkg: &str) -> Option<u32> {
         };
         let pid = pid_str.parse::<u32>().ok()?;
         let proc_path = format!("/proc/{pid}/cmdline");
-        let mut f = match fs::File::open(proc_path) { Ok(f)=>f, Err(_)=>continue };
+        let mut f = match fs::File::open(proc_path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
         let n = f.read(&mut buf).unwrap_or(0);
         let cmdline = &buf[0..n];
         if cmdline.windows(pkg.len()).any(|w| w == pkg.as_bytes()) {
@@ -74,55 +114,32 @@ fn find_game_pid() -> Option<u32> {
     get_pid_via_pidof(GAME_PKG).or_else(|| get_pid_by_proc_scan(GAME_PKG))
 }
 
-fn read_tid_stat(tid: u32) -> Option<(u64,u64)> {
+fn read_tid_stat(tid: u32) -> Option<(u64, u64)> {
     let stat_path = format!("/proc/{tid}/stat");
-    let mut stack_buf = [0u8;1024];
+    let mut stack_buf = [0u8; 1024];
     let mut fd = fs::File::open(stat_path).ok()?;
     let read_len = fd.read(&mut stack_buf).ok()?;
-    if read_len == 0 { return None; }
+    if read_len == 0 {
+        return None;
+    }
     let content = std::str::from_utf8(&stack_buf[0..read_len]).ok()?;
 
     let tokens = content.split_whitespace();
     let mut idx = 0usize;
-    let mut utime:Option<u64> = None;
-    let mut stime:Option<u64> = None;
+    let mut utime: Option<u64> = None;
+    let mut stime: Option<u64> = None;
     for tok in tokens {
-        idx +=1;
+        idx += 1;
         match idx {
             14 => utime = tok.parse().ok(),
             15 => stime = tok.parse().ok(),
             _ => {}
         }
-        if utime.is_some() && stime.is_some() { break; }
+        if utime.is_some() && stime.is_some() {
+            break;
+        }
     }
     Some((utime?, stime?))
-}
-
-fn set_thread_nice(tid: u32, nice: i32) -> bool {
-    setpriority(PrioWhich::Process(tid as i32), nice).is_ok()
-}
-
-fn get_thread_nice(tid: u32) -> Option<i32> {
-    getpriority(PrioWhich::Process(tid as i32)).ok()
-}
-
-fn daemonize_self() {
-    match fork() {
-        Ok(ForkResult::Child) => {},
-        Ok(ForkResult::Parent{..}) => std::process::exit(0),
-        Err(_) => return,
-    }
-    let _ = setsid();
-    match fork() {
-        Ok(ForkResult::Child) => {},
-        Ok(ForkResult::Parent{..}) => std::process::exit(0),
-        Err(_) => return,
-    }
-    if let Ok(devnull) = open("/dev/null", O_RDWR, Mode::empty()) {
-        let _ = dup2(&devnull, &mut std::io::stdin());
-        let _ = dup2(&devnull, &mut std::io::stdout());
-        let _ = dup2(&devnull, &mut std::io::stderr());
-    }
 }
 
 fn single_instance_check() -> bool {
@@ -130,7 +147,7 @@ fn single_instance_check() -> bool {
         Ok(d) => d,
         Err(_) => return true,
     };
-    let mut read_buf = [0u8;1024];
+    let mut read_buf = [0u8; 1024];
 
     for entry in dir_iter.flatten() {
         let fname = entry.file_name();
@@ -138,29 +155,42 @@ fn single_instance_check() -> bool {
             Some(s) if s.chars().all(|c| c.is_ascii_digit()) => s,
             _ => continue,
         };
-        let pid = match pid_str.parse::<u32>() {Ok(p)=>p,Err(_)=>continue};
+        let pid = match pid_str.parse::<u32>() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
 
         let cmd_path = format!("/proc/{pid}/cmdline");
-        let mut f = match fs::File::open(cmd_path) {Ok(f)=>f,Err(_)=>continue};
+        let mut f = match fs::File::open(cmd_path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
         let n = f.read(&mut read_buf).unwrap_or(0);
         if !read_buf[0..n].windows(BIN_NAME.len()).any(|w| w == BIN_NAME) {
             continue;
         }
 
         let stat_path = format!("/proc/{pid}/stat");
-        let mut sf = match fs::File::open(stat_path) {Ok(f)=>f,Err(_)=>continue};
+        let mut sf = match fs::File::open(stat_path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
         let rn = sf.read(&mut read_buf).unwrap_or(0);
-        let s = match std::str::from_utf8(&read_buf[0..rn]) {Ok(v)=>v,Err(_)=>continue};
+        let s = match std::str::from_utf8(&read_buf[0..rn]) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
         let t = s.split_whitespace();
         let mut idx = 0;
-        let mut ppid_opt:Option<u32> = None;
+        let mut ppid_opt: Option<u32> = None;
         for token in t {
-            idx +=1;
-            if idx ==4 {
+            idx += 1;
+            if idx == 4 {
                 ppid_opt = token.parse().ok();
                 break;
             }
         }
+        // ppid == 1 说明是已守护的后台实例
         if ppid_opt == Some(1) {
             return false;
         }
@@ -168,9 +198,9 @@ fn single_instance_check() -> bool {
     true
 }
 
-fn restore_all(restore_list:&mut Vec<(u32,i32)>) {
-    for (tid,old) in restore_list.iter() {
-        let _ = set_thread_nice(*tid,*old);
+fn restore_all(restore_list: &mut Vec<(u32, i32)>) {
+    for (tid, old) in restore_list.iter() {
+        let _ = set_thread_nice(*tid, *old);
     }
     restore_list.clear();
 }
@@ -180,13 +210,14 @@ fn main() -> io::Result<()> {
         eprintln!("daemon already running");
         std::process::exit(1);
     }
+
     daemonize_self();
 
-    let restore_list: Arc<Mutex<Vec<(u32,i32)>>> = Arc::new(Mutex::new(Vec::new()));
+    let restore_list: Arc<Mutex<Vec<(u32, i32)>>> = Arc::new(Mutex::new(Vec::new()));
     let rl_clone = Arc::clone(&restore_list);
 
-    thread::spawn(move ||{
-        let mut signals = Signals::new(&[SIGINT,SIGTERM]).unwrap();
+    thread::spawn(move || {
+        let mut signals = Signals::new(&[SIGINT, SIGTERM]).unwrap();
         for _ in signals.forever() {
             let mut guard = rl_clone.lock().unwrap();
             restore_all(&mut guard);
@@ -211,21 +242,27 @@ fn main() -> io::Result<()> {
         tids_buf.clear();
         let task_path = format!("/proc/{game_pid}/task");
         let dir_iter = match fs::read_dir(task_path) {
-            Ok(d)=>d,
-            Err(_)=>{
+            Ok(d) => d,
+            Err(_) => {
                 thread::sleep(Duration::from_millis(SAMPLE_INTERVAL_MS));
                 continue;
             }
         };
         for e in dir_iter.flatten() {
             let fname = e.file_name();
-            let s = match fname.to_str() { Some(v)=>v, None=>continue };
-            let tid = match s.parse::<u32>() { Ok(v)=>v, Err(_)=>continue };
+            let s = match fname.to_str() {
+                Some(v) => v,
+                None => continue,
+            };
+            let tid = match s.parse::<u32>() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
             tids_buf.push(tid);
         }
 
-        // 每轮清理死亡TID，防止内存上涨
-        let alive_set:HashSet<u32> = HashSet::from_iter(tids_buf.iter().copied());
+        // 每轮清理死亡 TID，防止内存上涨
+        let alive_set: HashSet<u32> = HashSet::from_iter(tids_buf.iter().copied());
         let mut dead_tids = Vec::new();
         for tid in thread_state_map.keys() {
             if !alive_set.contains(tid) {
@@ -236,14 +273,16 @@ fn main() -> io::Result<()> {
             if let Some(state) = thread_state_map.remove(&tid) {
                 if state.adjusted {
                     let mut g = restore_list.lock().unwrap();
-                    g.retain(|&(t,_)| t != tid);
+                    g.retain(|&(t, _)| t != tid);
                 }
             }
             cpu_history.remove(&tid);
         }
 
         for &tid in tids_buf.iter() {
-            let Some((utime, stime)) = read_tid_stat(tid) else { continue };
+            let Some((utime, stime)) = read_tid_stat(tid) else {
+                continue;
+            };
             let entry = cpu_history.entry(tid).or_default();
             let delta_u = utime.saturating_sub(entry.prev_utime);
             let delta_s = stime.saturating_sub(entry.prev_stime);
@@ -252,24 +291,27 @@ fn main() -> io::Result<()> {
             entry.prev_utime = utime;
             entry.prev_stime = stime;
             entry.total_delta += delta_total;
-            entry.sample_cnt +=1;
+            entry.sample_cnt += 1;
 
-            let jiff_per_sec = 100u64;
-            let window_jiff = WINDOW_SEC * jiff_per_sec;
+            const JIFF_PER_SEC: u64 = 100;
+            let window_jiff = WINDOW_SEC * JIFF_PER_SEC;
             if entry.total_delta > window_jiff {
                 entry.total_delta = window_jiff;
             }
 
             let avg_cpu_pct = (entry.total_delta as f32) / (WINDOW_SEC as f32);
-            let instant_pct = (delta_total as f32) * 100.0 / jiff_per_sec as f32;
+            let instant_pct = (delta_total as f32) * 100.0 / JIFF_PER_SEC as f32;
 
-            let state = thread_state_map.entry(tid).or_insert(ThreadState{orig_nice:0, adjusted:false});
+            let state = thread_state_map.entry(tid).or_insert(ThreadState {
+                orig_nice: 0,
+                adjusted: false,
+            });
 
             if (avg_cpu_pct > AVG_CPU_THRESHOLD || instant_pct > BURST_INSTANT_THRESHOLD) && !state.adjusted {
                 if let Some(cur_nice) = get_thread_nice(tid) {
                     state.orig_nice = cur_nice;
                     state.adjusted = true;
-                    restore_list.lock().unwrap().push((tid,cur_nice));
+                    restore_list.lock().unwrap().push((tid, cur_nice));
                     set_thread_nice(tid, MAX_NICE);
                 }
             }
