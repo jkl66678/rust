@@ -119,7 +119,7 @@ fn find_game_pid() -> Option<u32> {
 
 fn read_tid_stat(tid: u32) -> Option<(u64, u64)> {
     let s = fs::read_to_string(format!("/proc/{tid}/stat")).ok()?;
-    let mut sp = s.split_whitespace();
+    let sp = s.split_whitespace();
     let mut idx = 0;
     let mut utime: Option<u64> = None;
     let mut stime: Option<u64> = None;
@@ -142,7 +142,10 @@ fn get_all_tid(pid: u32) -> Vec<u32> {
     };
     for entry in dir.flatten() {
         let name = entry.file_name();
-        let tid_str = name.to_str()?;
+        let tid_str = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
         if let Ok(tid) = tid_str.parse::<u32>() {
             tids.push(tid);
         }
@@ -172,7 +175,7 @@ fn single_instance_check() -> bool {
 }
 
 fn restore_all(restore_list: &mut Vec<(u32, i32)>) {
-    for (tid, old_nice) in restore_list {
+    for (tid, old_nice) in &mut *restore_list {
         let _ = set_tid_nice(*tid, *old_nice);
     }
     restore_list.clear();
