@@ -1,210 +1,323 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::{self, Read};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use signal_hook::{consts::SIGINT, consts::SIGTERM, iterator::Signals};
+use nix::unistd::{setsid, fork, ForkResult};
+use signal_hook::{consts::{SIGINT, SIGTERM}, iterator::Signals};
 
-// ========== 调参区【极致省电优先直接用这套】 ==========
-const SAMPLE_INTERVAL_MS: u64 = 600;
-const IDLE_SLEEP_MS: u64 = 2500;
-const RESCAN_PID_EVERY_N: usize = 8; // 缓存pid，每8轮重新检测一次pid
+// ========== 配置区 ==========
+const SAMPLE_INTERVAL_MS: u64 = 500;
 const WINDOW_SEC: u64 = 3;
 const AVG_CPU_THRESHOLD: f32 = 3.5;
 const BURST_INSTANT_THRESHOLD: f32 = 25.0;
-const TARGET_NICE: i32 = 4;
+const MAX_NICE: i32 = 19;
 const GAME_PKG: &str = "com.tencent.tmgp.dfm";
+const BIN_NAME: &[u8] = b"dfm-daemon";
 
-const WHITELIST: [&str; 2] = ["GameThread", "RenderThread"];
-const BLACKLIST: [&str;4] = ["Thread-", "ace", "NativeThread", "TaskGraphNP 0"];
+#[derive(Debug,Default)]
+struct ThreadCpuSample {
+    prev_utime: u64,
+    prev_stime: u64,
+    total_delta: u64,
+    sample_cnt: u64,
+}
 
-#[derive(Debug)]
+#[derive(Debug,Copy,Clone)]
 struct ThreadState {
-    cpu_samples: Vec<u64>,
-    original_nice: Option<i32>,
+    orig_nice: i32,
+    adjusted: bool,
 }
 
-#[inline(always)]
-fn is_whitelist(comm: &str) -> bool {
-    WHITELIST.iter().any(|&s| comm == s)
-}
-
-#[inline(always)]
-fn is_blacklist(comm: &str) -> bool {
-    BLACKLIST.iter().any(|rule| {
-        if rule.ends_with('-') {
-            comm.starts_with(rule)
-        } else {
-            comm.contains(rule)
-        }
-    })
-}
-
-/// 优先 pidof，失败自动降级扫描/proc
-fn scan_game_pid() -> Option<u32> {
-    // 优先pidof
-    if let Ok(out) = std::process::Command::new("pidof")
-        .arg("-s")
-        .arg(GAME_PKG)
-        .output()
-    {
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !s.is_empty() {
-            if let Ok(pid) = s.parse::<u32>() {
-                return Some(pid);
-            }
-        }
+fn u32_to_buf(mut v: u32, buf: &mut [u8]) -> usize {
+    let mut pos = 0;
+    if v == 0 {
+        buf[0] = b'0';
+        return 1;
     }
-    // pidof不可用，降级手动遍历/proc
-    let dir = fs::read_dir("/proc").ok()?;
-    for entry in dir.flatten() {
-        let fname = entry.file_name();
-        let pid_str = fname.to_string_lossy();
-        let pid = match pid_str.parse::<u32>() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let mut buf = String::with_capacity(256);
-        buf.clear();
-        match fs::read_to_string(format!("/proc/{pid}/cmdline")) {
-            Ok(s) => buf.push_str(&s),
-            Err(_) => continue,
+    let mut tmp = [0u8;16];
+    let mut t = 0;
+    while v > 0 {
+        tmp[t] = (v % 10) as u8 + b'0';
+        v /=10;
+        t +=1;
+    }
+    while t>0 {
+        t -=1;
+        buf[pos] = tmp[t];
+        pos +=1;
+    }
+    pos
+}
+
+fn build_proc_tid_stat(tid: u32, buf: &mut [u8;64]) -> &[u8] {
+    let prefix = b"/proc/";
+    buf[0..prefix.len()].copy_from_slice(prefix);
+    let mut off = prefix.len();
+    let len = u32_to_buf(tid, &mut buf[off..]);
+    off += len;
+    let suffix = b"/stat";
+    buf[off..off+suffix.len()].copy_from_slice(suffix);
+    off += suffix.len();
+    &buf[0..off]
+}
+
+fn build_proc_task(pid: u32, buf: &mut [u8;64]) -> &[u8] {
+    let prefix = b"/proc/";
+    buf[0..prefix.len()].copy_from_slice(prefix);
+    let mut off = prefix.len();
+    let len = u32_to_buf(pid, &mut buf[off..]);
+    off += len;
+    let suffix = b"/task";
+    buf[off..off+suffix.len()].copy_from_slice(suffix);
+    off += suffix.len();
+    &buf[0..off]
+}
+
+fn build_proc_cmdline(pid: u32, buf: &mut [u8;64]) -> &[u8] {
+    let prefix = b"/proc/";
+    buf[0..prefix.len()].copy_from_slice(prefix);
+    let mut off = prefix.len();
+    let len = u32_to_buf(pid, &mut buf[off..]);
+    off += len;
+    let suffix = b"/cmdline";
+    buf[off..off+suffix.len()].copy_from_slice(suffix);
+    off += suffix.len();
+    &buf[0..off]
+}
+
+fn build_proc_stat(pid: u32, buf: &mut [u8;64]) -> &[u8] {
+    let prefix = b"/proc/";
+    buf[0..prefix.len()].copy_from_slice(prefix);
+    let mut off = prefix.len();
+    let len = u32_to_buf(pid, &mut buf[off..]);
+    off += len;
+    let suffix = b"/stat";
+    buf[off..off+suffix.len()].copy_from_slice(suffix);
+    off += suffix.len();
+    &buf[0..off]
+}
+
+fn get_pid_via_pidof(pkg: &str) -> Option<u32> {
+    let out = Command::new("pidof").arg("-s").arg(pkg).output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            s.trim().parse::<u32>().ok()
         }
-        if buf.contains(GAME_PKG) {
+        _ => None
+    }
+}
+
+fn get_pid_by_proc_scan(pkg: &str) -> Option<u32> {
+    let dir_iter = match fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(_) => return None,
+    };
+    let mut path_buf = [0u8;64];
+    let mut buf = [0u8;512];
+    for entry in dir_iter.flatten() {
+        let name = entry.file_name();
+        let pid_str = match name.to_str() {
+            Some(s) if s.chars().all(|c| c.is_ascii_digit()) => s,
+            _ => continue,
+        };
+        let pid = pid_str.parse::<u32>().ok()?;
+        let proc_path = build_proc_cmdline(pid, &mut path_buf);
+        let mut f = match fs::File::open(proc_path) { Ok(f)=>f, Err(_)=>continue };
+        let n = f.read(&mut buf).unwrap_or(0);
+        let cmdline = &buf[0..n];
+        if cmdline.windows(pkg.len()).any(|w| w == pkg.as_bytes()) {
             return Some(pid);
         }
     }
     None
 }
 
-#[inline(always)]
-fn get_all_tid(pid: u32) -> Vec<u32> {
-    let mut tids = Vec::with_capacity(64);
-    let dir = match fs::read_dir(format!("/proc/{pid}/task")) {
+fn find_game_pid() -> Option<u32> {
+    get_pid_via_pidof(GAME_PKG).or_else(|| get_pid_by_proc_scan(GAME_PKG))
+}
+
+fn read_tid_stat(tid: u32) -> Option<(u64,u64)> {
+    let mut path_buf = [0u8;64];
+    let stat_path = build_proc_tid_stat(tid, &mut path_buf);
+    let mut stack_buf = [0u8;1024];
+    let mut fd = fs::File::open(stat_path).ok()?;
+    let read_len = fd.read(&mut stack_buf).ok()?;
+    if read_len == 0 { return None; }
+    let content = unsafe { std::str::from_utf8_unchecked(&stack_buf[0..read_len]) };
+
+    let mut tokens = content.split_whitespace();
+    let mut idx = 0usize;
+    let mut utime:Option<u64> = None;
+    let mut stime:Option<u64> = None;
+    for tok in tokens {
+        idx +=1;
+        match idx {
+            14 => utime = tok.parse().ok(),
+            15 => stime = tok.parse().ok(),
+            _ => {}
+        }
+        if utime.is_some() && stime.is_some() { break; }
+    }
+    Some((utime?, stime?))
+}
+
+fn set_thread_nice(tid: u32, nice: i32) -> bool {
+    unsafe { libc::setpriority(libc::PRIO_PROCESS, tid, nice) == 0 }
+}
+
+fn daemonize_self() {
+    match fork() {
+        Ok(ForkResult::Child) => {},
+        Ok(ForkResult::Parent{..}) => std::process::exit(0),
+        Err(_) => return,
+    }
+    setsid().ok();
+    match fork() {
+        Ok(ForkResult::Child) => {},
+        Ok(ForkResult::Parent{..}) => std::process::exit(0),
+        Err(_) => return,
+    }
+    let null = std::fs::File::open("/dev/null").unwrap();
+    let _ = std::io::stdin().take();
+    let _ = std::io::stdout().take();
+    let _ = std::io::stderr().take();
+    std::mem::forget(null);
+}
+
+fn single_instance_check() -> bool {
+    let dir_iter = match fs::read_dir("/proc") {
         Ok(d) => d,
-        Err(_) => return tids,
+        Err(_) => return true,
     };
-    for entry in dir.flatten() {
-        let tid_name = entry.file_name();
-        if let Ok(tid) = tid_name.to_string_lossy().parse::<u32>() {
-            tids.push(tid);
+    let mut path_buf = [0u8;64];
+    let mut read_buf = [0u8;1024];
+
+    for entry in dir_iter.flatten() {
+        let fname = entry.file_name();
+        let pid_str = match fname.to_str() {
+            Some(s) if s.chars().all(|c| c.is_ascii_digit()) => s,
+            _ => continue,
+        };
+        let pid = match pid_str.parse::<u32>() {Ok(p)=>p,Err(_)=>continue};
+
+        let cmd_path = build_proc_cmdline(pid, &mut path_buf);
+        let mut f = match fs::File::open(cmd_path) {Ok(f)=>f,Err(_)=>continue};
+        let n = f.read(&mut read_buf).unwrap_or(0);
+        if !read_buf[0..n].windows(BIN_NAME.len()).any(|w| w == BIN_NAME) {
+            continue;
+        }
+
+        let stat_path = build_proc_stat(pid, &mut path_buf);
+        let mut sf = match fs::File::open(stat_path) {Ok(f)=>f,Err(_)=>continue};
+        let rn = sf.read(&mut read_buf).unwrap_or(0);
+        let s = unsafe { std::str::from_utf8_unchecked(&read_buf[0..rn]) };
+        let mut t = s.split_whitespace();
+        let mut idx = 0;
+        let mut ppid_opt:Option<u32> = None;
+        for token in t {
+            idx +=1;
+            if idx ==4 {
+                ppid_opt = token.parse().ok();
+                break;
+            }
+        }
+        if ppid_opt == Some(1) {
+            return false;
         }
     }
-    tids
+    true
 }
 
-#[inline(always)]
-fn read_tid_stat(tid: u32) -> Option<(u64, String, i32)> {
-    let stat_raw = fs::read_to_string(format!("/proc/{tid}/stat")).ok()?;
-    let mut parts = stat_raw.split_whitespace();
-    let comm = parts.nth(1)?.trim_start_matches('(').trim_end_matches(')').to_string();
-    let utime: u64 = parts.nth(11)?.parse().ok()?;
-    let stime: u64 = parts.next()?.parse().ok()?;
-    let nice: i32 = parts.nth(2)?.parse().ok()?;
-    Some((utime + stime, comm, nice))
+fn restore_all(restore_list:&mut Vec<(u32,i32)>) {
+    for (tid,old) in restore_list.iter() {
+        let _ = set_thread_nice(*tid,*old);
+    }
+    restore_list.clear();
 }
 
-#[inline(always)]
-fn set_tid_nice(tid: u32, nice_val: i32) -> bool {
-    fs::write(format!("/proc/{tid}/nice"), format!("{}", nice_val)).is_ok()
-}
+fn main() -> io::Result<()> {
+    if !single_instance_check() {
+        eprintln!("daemon already running");
+        std::process::exit(1);
+    }
+    daemonize_self();
 
-fn main() {
-    let mut signals = Signals::new(&[SIGINT, SIGTERM]).unwrap();
-    let restore_list: Arc<Mutex<Vec<(u32, i32)>>> = Arc::new(Mutex::new(Vec::new()));
-    let restore_clone = Arc::clone(&restore_list);
+    let restore_list: Arc<Mutex<Vec<(u32,i32)>>> = Arc::new(Mutex::new(Vec::new()));
+    let rl_clone = Arc::clone(&restore_list);
 
-    // 信号线程独立
-    thread::spawn(move || {
-        for sig in signals.forever() {
-            let mut guard = restore_clone.lock().unwrap();
-            for (tid, old_nice) in guard.iter() {
-                let _ = set_tid_nice(*tid, *old_nice);
-            }
-            guard.clear();
-            std::process::exit(sig);
+    thread::spawn(move ||{
+        let mut signals = Signals::new(&[SIGINT,SIGTERM]).unwrap();
+        for _ in signals.forever() {
+            let mut guard = rl_clone.lock().unwrap();
+            restore_all(&mut guard);
+            std::process::exit(0);
         }
     });
 
-    let sample_count = (WINDOW_SEC * 1000 / SAMPLE_INTERVAL_MS) as usize;
-    let mut thread_map: HashMap<u32, ThreadState> = HashMap::new();
-    let mut cached_pid: Option<u32> = None;
-    let mut loop_counter: usize = 0;
+    let mut thread_state_map: HashMap<u32, ThreadState> = HashMap::new();
+    let mut cpu_history: HashMap<u32, ThreadCpuSample> = HashMap::new();
+    let mut tids_buf: Vec<u32> = Vec::with_capacity(128);
 
     loop {
-        loop_counter += 1;
-        // 每N轮才重新扫描pid，复用缓存
-        if loop_counter % RESCAN_PID_EVERY_N == 0 || cached_pid.is_none() {
-            cached_pid = scan_game_pid();
-        }
-
-        let Some(game_pid) = cached_pid else {
-            thread_map.clear();
-            thread::sleep(Duration::from_millis(IDLE_SLEEP_MS));
+        let Some(game_pid) = find_game_pid() else {
+            // 游戏消失立刻还原全部，清理缓存
+            let mut guard = restore_list.lock().unwrap();
+            restore_all(&mut guard);
+            thread_state_map.clear();
+            cpu_history.clear();
+            thread::sleep(Duration::from_millis(SAMPLE_INTERVAL_MS));
             continue;
         };
 
-        // 校验pid是否存活，防止缓存失效（进程退出但pid复用）
-        if fs::read_to_string(format!("/proc/{game_pid}/cmdline")).is_err() {
-            cached_pid = None;
-            thread_map.clear();
-            continue;
-        }
-
-        let tids = get_all_tid(game_pid);
-        let mut alive_tids = HashMap::new();
-
-        for tid in tids {
-            let Some((cpu_total, comm, current_nice)) = read_tid_stat(tid) else {
-                continue;
-            };
-            if is_whitelist(&comm) {
-                continue;
-            }
-            if !is_blacklist(&comm) {
-                continue;
-            }
-
-            let state = thread_map.entry(tid).or_insert_with(|| ThreadState {
-                cpu_samples: Vec::with_capacity(sample_count),
-                original_nice: Some(current_nice),
-            });
-
-            state.cpu_samples.push(cpu_total);
-            if state.cpu_samples.len() > sample_count {
-                state.cpu_samples.remove(0);
-            }
-            alive_tids.insert(tid, ());
-
-            if state.cpu_samples.len() >= 2 {
-                let delta_cpu = state.cpu_samples.last().unwrap() - state.cpu_samples[state.cpu_samples.len() - 2];
-                let instant_cpu = delta_cpu as f32 * 100.0 / (SAMPLE_INTERVAL_MS as f32 * 10.0);
-                let mut trigger = false;
-
-                if instant_cpu > BURST_INSTANT_THRESHOLD {
-                    trigger = true;
-                }
-                if state.cpu_samples.len() >= sample_count {
-                    let avg_delta = state.cpu_samples.last().unwrap() - state.cpu_samples[0];
-                    let avg_cpu = avg_delta as f32 *100.0 / ((WINDOW_SEC *1000) as f32 *10.0);
-                    if avg_cpu > AVG_CPU_THRESHOLD {
-                        trigger = true;
-                    }
-                }
-
-                if trigger && current_nice < TARGET_NICE {
-                    if set_tid_nice(tid, TARGET_NICE) {
-                        if let Some(old) = state.original_nice {
-                            let mut guard = restore_list.lock().unwrap();
-                            if !guard.iter().any(|(t,_)| *t == tid) {
-                                guard.push((tid, old));
-                            }
-                        }
-                    }
-                }
+        tids_buf.clear();
+        {
+            let mut buf = [0u8;64];
+            let task_path = build_proc_task(game_pid, &mut buf);
+            let dir_iter = match fs::read_dir(task_path) { Ok(d)=>d, Err(_)=>{ thread::sleep(Duration::from_millis(SAMPLE_INTERVAL_MS)); continue; } };
+            for e in dir_iter.flatten() {
+                let fname = e.file_name();
+                let s = match fname.to_str() { Some(v)=>v, None=>continue };
+                let tid = match s.parse::<u32>() { Ok(v)=>v, Err(_)=>continue };
+                tids_buf.push(tid);
             }
         }
-        thread_map.retain(|tid, _| alive_tids.contains_key(tid));
+
+        for &tid in tids_buf.iter() {
+            let Some((utime, stime)) = read_tid_stat(tid) else { continue };
+            let entry = cpu_history.entry(tid).or_default();
+            let delta_u = utime.saturating_sub(entry.prev_utime);
+            let delta_s = stime.saturating_sub(entry.prev_stime);
+            let delta_total = delta_u + delta_s;
+
+            entry.prev_utime = utime;
+            entry.prev_stime = stime;
+            entry.total_delta += delta_total;
+            entry.sample_cnt +=1;
+
+            let jiff_per_sec = 100u64;
+            let window_jiff = WINDOW_SEC * jiff_per_sec;
+            if entry.total_delta > window_jiff {
+                entry.total_delta = window_jiff;
+            }
+
+            let avg_cpu_pct = (entry.total_delta as f32) / (WINDOW_SEC as f32);
+            let instant_pct = (delta_total as f32) * 100.0 / jiff_per_sec as f32;
+
+            let state = thread_state_map.entry(tid).or_insert(ThreadState{orig_nice:0, adjusted:false});
+
+            if (avg_cpu_pct > AVG_CPU_THRESHOLD || instant_pct > BURST_INSTANT_THRESHOLD) && !state.adjusted {
+                let cur_nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, tid) };
+                state.orig_nice = cur_nice;
+                state.adjusted = true;
+                restore_list.lock().unwrap().push((tid,cur_nice));
+                set_thread_nice(tid, MAX_NICE);
+            }
+        }
+
         thread::sleep(Duration::from_millis(SAMPLE_INTERVAL_MS));
     }
 }
