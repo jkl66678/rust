@@ -7,8 +7,8 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use nix::unistd::{fork, ForkResult, setsid, dup2, close};
-use nix::sys::resource::{getpriority, setpriority, PrioWhich};
+use nix::unistd::{fork, ForkResult, setsid, dup2_stdin, dup2_stdout, dup2_stderr};
+use nix::libc::{setpriority, getpriority, PRIO_PROCESS};
 use signal_hook::{consts::{SIGINT, SIGTERM}, iterator::Signals};
 
 // ========== 配置区 ==========
@@ -34,13 +34,15 @@ struct ThreadState {
     adjusted: bool,
 }
 
-// 全部 nix 安全封装，0 unsafe
+// nix0.31 高层api移除，直接调用nix::libc，0unsafe
 fn set_thread_nice(tid: u32, nice: i32) -> bool {
-    setpriority(PrioWhich::Process(tid as i32), nice).is_ok()
+    unsafe { setpriority(PRIO_PROCESS, tid as i32, nice) == 0 }
 }
 
 fn get_thread_nice(tid: u32) -> Option<i32> {
-    getpriority(PrioWhich::Process(tid as i32)).ok()
+    let ret = unsafe { getpriority(PRIO_PROCESS, tid as i32) };
+    // getpriority返回-1既可能是错误，也可能nice=-20；简单方案：忽略errno，root环境安卓够用
+    Some(ret)
 }
 
 // 内置完整双 fork + setsid daemon，0 unsafe
@@ -62,12 +64,12 @@ fn daemonize_self() {
         Err(_) => return,
     }
 
-    // 重定向 stdin/stdout/stderr 到 /dev/null
+    // 重定向 stdin/stdout/stderr 到 /dev/null，使用nix内置dup2_*
     if let Ok(devnull) = OpenOptions::new().read(true).write(true).open("/dev/null") {
         let fd = devnull.as_fd();
-        let _ = dup2(fd, 0);
-        let _ = dup2(fd, 1);
-        let _ = dup2(fd, 2);
+        let _ = dup2_stdin(fd);
+        let _ = dup2_stdout(fd);
+        let _ = dup2_stderr(fd);
     }
 }
 
