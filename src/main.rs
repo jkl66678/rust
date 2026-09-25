@@ -1,15 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::{self, Read};
+use std::os::fd::AsFd;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use nix::unistd::{fork, ForkResult, setsid, dup2, close};
-use nix::fs::open;
-use nix::fcntl::OFlag;
-use nix::sys::stat::Mode;
-use nix::priority::{getpriority, setpriority, PrioWhich};
+use nix::sys::resource::{getpriority, setpriority, PrioWhich};
 use signal_hook::{consts::{SIGINT, SIGTERM}, iterator::Signals};
 
 // ========== 配置区 ==========
@@ -64,11 +63,11 @@ fn daemonize_self() {
     }
 
     // 重定向 stdin/stdout/stderr 到 /dev/null
-    if let Ok(devnull) = open("/dev/null", OFlag::O_RDWR, Mode::empty()) {
-        let _ = dup2(devnull, 0);
-        let _ = dup2(devnull, 1);
-        let _ = dup2(devnull, 2);
-        let _ = close(devnull);
+    if let Ok(devnull) = OpenOptions::new().read(true).write(true).open("/dev/null") {
+        let fd = devnull.as_fd();
+        let _ = dup2(fd, 0);
+        let _ = dup2(fd, 1);
+        let _ = dup2(fd, 2);
     }
 }
 
