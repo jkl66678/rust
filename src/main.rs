@@ -1,14 +1,13 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Read};
-use std::os::unix::io::AsRawFd;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use nix::unistd::{fork, ForkResult, setsid, dup2};
-use nix::sys::resource::{getpriority, setpriority, PrioWhich};
+use rustix::process::{self, ForkResult, PriorityKind};
+use rustix::io::dup2;
 use signal_hook::{consts::{SIGINT, SIGTERM}, iterator::Signals};
 
 // ========== 配置区 ==========
@@ -16,7 +15,7 @@ const SAMPLE_INTERVAL_MS: u64 = 500;
 const WINDOW_SEC: u64 = 3;
 const AVG_CPU_THRESHOLD: f32 = 3.5;
 const BURST_INSTANT_THRESHOLD: f32 = 25.0;
-const MAX_NICE: i32 = 19;
+const TARGET_NICE: i32 = 19;
 const GAME_PKG: &str = "com.tencent.tmgp.dfm";
 const BIN_NAME: &[u8] = b"dfm-daemon";
 
@@ -35,34 +34,36 @@ struct ThreadState {
 }
 
 fn set_thread_nice(tid: u32, nice: i32) -> bool {
-    setpriority(PrioWhich::Process(tid as i32), nice).is_ok()
+    process::setpriority(PriorityKind::Process, tid, nice).is_ok()
 }
 
 fn get_thread_nice(tid: u32) -> Option<i32> {
-    getpriority(PrioWhich::Process(tid as i32)).ok()
+    process::getpriority(PriorityKind::Process, tid).ok()
 }
 
-// 双fork + setsid 守护进程
+fn read_thread_comm(tid: u32) -> Option<String> {
+    let path = format!("/proc/{tid}/comm");
+    let mut buf = String::new();
+    let mut f = fs::File::open(path).ok()?;
+    f.read_to_string(&mut buf).ok()?;
+    Some(buf.trim_end().to_string())
+}
+
 fn daemonize_self() {
-    match fork() {
-        Ok(ForkResult::Child) => {}
-        Ok(ForkResult::Parent { .. }) => std::process::exit(0),
-        Err(_) => return,
+    match process::fork().unwrap() {
+        ForkResult::Child => {}
+        ForkResult::Parent { .. } => std::process::exit(0),
     }
-
-    let _ = setsid();
-
-    match fork() {
-        Ok(ForkResult::Child) => {}
-        Ok(ForkResult::Parent { .. }) => std::process::exit(0),
-        Err(_) => return,
+    let _ = process::setsid();
+    match process::fork().unwrap() {
+        ForkResult::Child => {}
+        ForkResult::Parent { .. } => std::process::exit(0),
     }
-
     if let Ok(devnull) = OpenOptions::new().read(true).write(true).open("/dev/null") {
-        let fd = devnull.as_raw_fd();
-        let _ = dup2(fd, 0);
-        let _ = dup2(fd, 1);
-        let _ = dup2(fd, 2);
+        let fd = devnull;
+        let _ = dup2(&fd, rustix::io::STDIN_FD);
+        let _ = dup2(&fd, rustix::io::STDOUT_FD);
+        let _ = dup2(&fd, rustix::io::STDERR_FD);
     }
 }
 
@@ -117,7 +118,6 @@ fn read_tid_stat(tid: u32) -> Option<(u64, u64)> {
         return None;
     }
     let content = std::str::from_utf8(&stack_buf[0..read_len]).ok()?;
-
     let tokens = content.split_whitespace();
     let mut idx = 0usize;
     let mut utime: Option<u64> = None;
@@ -142,7 +142,6 @@ fn single_instance_check() -> bool {
         Err(_) => return true,
     };
     let mut read_buf = [0u8; 1024];
-
     for entry in dir_iter.flatten() {
         let fname = entry.file_name();
         let pid_str = match fname.to_str() {
@@ -153,7 +152,6 @@ fn single_instance_check() -> bool {
             Ok(p) => p,
             Err(_) => continue,
         };
-
         let cmd_path = format!("/proc/{pid}/cmdline");
         let mut f = match fs::File::open(cmd_path) {
             Ok(f) => f,
@@ -163,7 +161,6 @@ fn single_instance_check() -> bool {
         if !read_buf[0..n].windows(BIN_NAME.len()).any(|w| w == BIN_NAME) {
             continue;
         }
-
         let stat_path = format!("/proc/{pid}/stat");
         let mut sf = match fs::File::open(stat_path) {
             Ok(f) => f,
@@ -198,12 +195,30 @@ fn restore_all(restore_list: &mut Vec<(u32, i32)>) {
     restore_list.clear();
 }
 
+fn get_all_tid(pid: u32) -> Vec<u32> {
+    let mut tids = Vec::new();
+    let dir = match fs::read_dir(format!("/proc/{pid}/task")) {
+        Ok(d) => d,
+        Err(_) => return tids,
+    };
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let tid_str = match name.to_str() {
+            Some(s) if s.chars().all(|c| c.is_ascii_digit()) => s,
+            _ => continue,
+        };
+        if let Ok(tid) = tid_str.parse::<u32>() {
+            tids.push(tid);
+        }
+    }
+    tids
+}
+
 fn main() -> io::Result<()> {
     if !single_instance_check() {
         eprintln!("daemon already running");
         std::process::exit(1);
     }
-
     daemonize_self();
 
     let restore_list: Arc<Mutex<Vec<(u32, i32)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -220,94 +235,83 @@ fn main() -> io::Result<()> {
 
     let mut thread_state_map: HashMap<u32, ThreadState> = HashMap::new();
     let mut cpu_history: HashMap<u32, ThreadCpuSample> = HashMap::new();
-    let mut tids_buf: Vec<u32> = Vec::with_capacity(128);
+    const JIFF_PER_SEC: u64 = 100;
 
     loop {
         let Some(game_pid) = find_game_pid() else {
-            let mut guard = restore_list.lock().unwrap();
-            restore_all(&mut guard);
+            let mut g = restore_list.lock().unwrap();
+            restore_all(&mut g);
             thread_state_map.clear();
             cpu_history.clear();
             thread::sleep(Duration::from_millis(SAMPLE_INTERVAL_MS));
             continue;
         };
 
-        tids_buf.clear();
-        let task_path = format!("/proc/{game_pid}/task");
-        let dir_iter = match fs::read_dir(task_path) {
-            Ok(d) => d,
-            Err(_) => {
-                thread::sleep(Duration::from_millis(SAMPLE_INTERVAL_MS));
+        let tids = get_all_tid(game_pid);
+        for tid in tids {
+            // ========= 核心过滤：只处理这两类线程，其余全部跳过 =========
+            let comm = match read_thread_comm(tid) {
+                Some(c) => c,
+                None => continue,
+            };
+            let is_target = comm == "TaskGraphNP 0" || comm.starts_with("Thread-");
+            if !is_target {
                 continue;
             }
-        };
-        for e in dir_iter.flatten() {
-            let fname = e.file_name();
-            let s = match fname.to_str() {
+            // ======================================================
+
+            let (utime, stime) = match read_tid_stat(tid) {
                 Some(v) => v,
                 None => continue,
             };
-            let tid = match s.parse::<u32>() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            tids_buf.push(tid);
-        }
-
-        let alive_set: HashSet<u32> = HashSet::from_iter(tids_buf.iter().copied());
-        let mut dead_tids = Vec::new();
-        for tid in thread_state_map.keys() {
-            if !alive_set.contains(tid) {
-                dead_tids.push(*tid);
-            }
-        }
-        for tid in dead_tids {
-            if let Some(state) = thread_state_map.remove(&tid) {
-                if state.adjusted {
-                    let mut g = restore_list.lock().unwrap();
-                    g.retain(|&(t, _)| t != tid);
-                }
-            }
-            cpu_history.remove(&tid);
-        }
-
-        for &tid in tids_buf.iter() {
-            let Some((utime, stime)) = read_tid_stat(tid) else {
-                continue;
-            };
             let entry = cpu_history.entry(tid).or_default();
-            let delta_u = utime.saturating_sub(entry.prev_utime);
-            let delta_s = stime.saturating_sub(entry.prev_stime);
-            let delta_total = delta_u + delta_s;
-
+            let delta = (utime + stime).saturating_sub(entry.prev_utime + entry.prev_stime);
             entry.prev_utime = utime;
             entry.prev_stime = stime;
-            entry.total_delta += delta_total;
+            entry.total_delta += delta;
             entry.sample_cnt += 1;
 
-            const JIFF_PER_SEC: u64 = 100;
-            let window_jiff = WINDOW_SEC * JIFF_PER_SEC;
-            if entry.total_delta > window_jiff {
-                entry.total_delta = window_jiff;
-            }
-
-            let avg_cpu_pct = (entry.total_delta as f32) / (WINDOW_SEC as f32);
-            let instant_pct = (delta_total as f32) * 100.0 / JIFF_PER_SEC as f32;
+            let instant_pct = delta as f32 * 100.0 / (JIFF_PER_SEC * SAMPLE_INTERVAL_MS / 1000) as f32;
+            let avg_pct = entry.total_delta as f32 * 100.0 / (JIFF_PER_SEC * WINDOW_SEC) as f32;
 
             let state = thread_state_map.entry(tid).or_insert(ThreadState {
                 orig_nice: 0,
                 adjusted: false,
             });
 
-            if (avg_cpu_pct > AVG_CPU_THRESHOLD || instant_pct > BURST_INSTANT_THRESHOLD) && !state.adjusted {
-                if let Some(cur_nice) = get_thread_nice(tid) {
-                    state.orig_nice = cur_nice;
+            if state.adjusted {
+                continue;
+            }
+
+            let need_throttle = if comm == "TaskGraphNP 0" {
+                true
+            } else {
+                avg_pct > AVG_CPU_THRESHOLD || instant_pct > BURST_INSTANT_THRESHOLD
+            };
+
+            if need_throttle {
+                if let Some(nice_val) = get_thread_nice(tid) {
+                    state.orig_nice = nice_val;
                     state.adjusted = true;
-                    restore_list.lock().unwrap().push((tid, cur_nice));
-                    set_thread_nice(tid, MAX_NICE);
+                    let mut rl = restore_list.lock().unwrap();
+                    rl.push((tid, nice_val));
+                    let _ = set_thread_nice(tid, TARGET_NICE);
                 }
             }
         }
+
+        // 清理已经消失的TID
+        cpu_history.retain(|tid, _| {
+            if !thread_state_map.contains_key(tid) {
+                false
+            } else {
+                true
+            }
+        });
+        thread_state_map.retain(|tid, _| {
+            let path = format!("/proc/{tid}");
+            fs::exists(path).unwrap_or(false)
+        });
 
         thread::sleep(Duration::from_millis(SAMPLE_INTERVAL_MS));
     }
