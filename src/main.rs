@@ -1,292 +1,543 @@
-use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read, Write};
-use std::path::Path;
-use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::io::{self, Write, BufRead};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::thread;
-use std::time::Duration;
-use libc;
-use signal_hook::{consts::{SIGINT, SIGTERM}, iterator::Signals};
 
-// ========== 配置区 ==========
-const SAMPLE_INTERVAL_MS: u64 = 500;
-const WINDOW_SEC: u64 = 3;
-const AVG_CPU_THRESHOLD: f32 = 3.5;
-const BURST_INSTANT_THRESHOLD: f32 = 25.0;
-const TARGET_NICE: i32 = 19;
-const GAME_PKG: &str = "com.tencent.tmgp.dfm";
-const PID_FILE: &str = "/data/adb/dfm-daemon.pid";
+// ==================== 配置区 ====================
+const DEFAULT_INTERVAL: u64 = 1;
+const RESET_INTERVAL_SECS: u64 = 21600;
+const PID_FILE: &str = "/data/adb/anr_cleaner.pid";
 
-#[derive(Debug, Default)]
-struct ThreadCpuSample {
-    prev_utime: u64,
-    prev_stime: u64,
-    total_delta: u64,
-    sample_cnt: u64,
+const SAFE_CLEAN_PATHS: &[&str] = &[
+    "/data/anr",
+    "/data/system/dropbox",
+    "/data/tombstones",
+    "/data/aee_exp",
+    "/data/media/0/Android/media",
+];
+
+const FULL_DELETE_PATHS: &[&str] = &[
+    "/data/media/0/Documents",
+    "/data/media/0/.yuetu_unlock",
+    "/data/media/0/.vivocrash",
+    "/data/media/0/.vivoBrowser",
+    "/data/media/0/.tbs",
+    "/data/media/0/.BBKAppStore",
+    "/data/media/0/阅图锁屏",
+    "/data/media/0/Pictures/Nekogram",
+    "/data/media/0/.系统文件，请勿删除",
+    "/data/media/0/xinhao",
+    "/data/media/0/Download/.TempDragFile",
+    "/data/media/0/Download/QQ",
+    "/data/media/0/Download/.csj",
+];
+
+const TIMESTAMP_TARGETS: &[&str] = &[
+    "/dev/ptmx",
+    "/tmp",
+    "/data/adb",
+];
+
+// ==================== 配置结构体 ====================
+#[derive(Debug, Clone)]
+struct Config {
+    interval: u64,
+    safe_clean_paths: Vec<PathBuf>,
+    full_delete_paths: Vec<PathBuf>,
+    timestamp_targets: Vec<PathBuf>,
+    target_timestamp: SystemTime,
+    pid_file: PathBuf,
+    reset_interval: Duration,
 }
 
-#[derive(Debug, Copy, Clone)]
-struct ThreadState {
-    orig_nice: i32,
-    adjusted: bool,
-}
-
-/// 设置tid的nice，unsafe完全封装在函数内部
-fn set_tid_nice(tid: u32, nice: i32) -> bool {
-    unsafe {
-        libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, nice) == 0
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            interval: DEFAULT_INTERVAL,
+            safe_clean_paths: SAFE_CLEAN_PATHS.iter().map(|s| PathBuf::from(*s)).collect(),
+            full_delete_paths: FULL_DELETE_PATHS.iter().map(|s| PathBuf::from(*s)).collect(),
+            timestamp_targets: TIMESTAMP_TARGETS.iter().map(|s| PathBuf::from(*s)).collect(),
+            target_timestamp: UNIX_EPOCH,
+            pid_file: PathBuf::from(PID_FILE),
+            reset_interval: Duration::from_secs(RESET_INTERVAL_SECS),
+        }
     }
 }
 
-/// 获取tid的nice，unsafe完全封装在函数内部
-fn get_tid_nice(tid: u32) -> Option<i32> {
-    unsafe {
-        let r = libc::getpriority(libc::PRIO_PROCESS, tid as libc::id_t);
-        if r == -1 {
-            let err = *libc::__errno_location();
-            if err != 0 {
-                return None;
+// ==================== PID 管理 ====================
+struct PidManager {
+    pid_file: PathBuf,
+}
+
+impl PidManager {
+    fn new(pid_file: PathBuf) -> Self {
+        PidManager { pid_file }
+    }
+
+    fn read_pid(&self) -> Option<u32> {
+        fs::read_to_string(&self.pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+    }
+
+    fn is_running(&self) -> bool {
+        if let Some(pid) = self.read_pid() {
+            fs::metadata(format!("/proc/{}", pid)).is_ok()
+        } else {
+            false
+        }
+    }
+
+    fn write_pid(&self) -> std::io::Result<()> {
+        let pid = std::process::id();
+        fs::write(&self.pid_file, pid.to_string())
+    }
+
+    fn remove_pid(&self) -> std::io::Result<()> {
+        if self.pid_file.exists() {
+            fs::remove_file(&self.pid_file)?;
+        }
+        Ok(())
+    }
+
+    fn stop(&self) -> Result<bool, std::io::Error> {
+        if let Some(pid) = self.read_pid() {
+            self.remove_pid()?;
+
+            for _ in 0..100 {
+                thread::sleep(Duration::from_millis(100));
+                if !self.is_running() {
+                    return Ok(true);
+                }
             }
-        }
-        Some(r)
-    }
-}
 
-/// 双fork + setsid 守护进程，unsafe收拢在此函数
-fn daemonize() -> io::Result<()> {
-    unsafe {
-        let pid1 = libc::fork();
-        if pid1 < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if pid1 > 0 {
-            std::process::exit(0);
-        }
+            let _ = Command::new("kill")
+                .arg("-9")
+                .arg(pid.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
 
-        libc::setsid();
-
-        let pid2 = libc::fork();
-        if pid2 < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if pid2 > 0 {
-            std::process::exit(0);
-        }
-
-        let devnull = libc::open(b"/dev/null\0".as_ptr(), libc::O_RDWR, 0);
-        libc::dup2(devnull, 0);
-        libc::dup2(devnull, 1);
-        libc::dup2(devnull, 2);
-        libc::close(devnull);
-    }
-    Ok(())
-}
-
-fn read_thread_comm(tid: u32) -> Option<String> {
-    let path = format!("/proc/{tid}/comm");
-    let mut f = fs::File::open(path).ok()?;
-    let mut buf = String::new();
-    f.read_to_string(&mut buf).ok()?;
-    Some(buf.trim_end().to_string())
-}
-
-fn get_pid_via_pidof(pkg: &str) -> Option<u32> {
-    let out = Command::new("pidof").arg(pkg).output().ok()?;
-    let s = String::from_utf8_lossy(&out.stdout);
-    s.split_whitespace().next()?.parse().ok()
-}
-
-fn get_pid_by_proc_scan(pkg: &str) -> Option<u32> {
-    let dir = fs::read_dir("/proc").ok()?;
-    for entry in dir.flatten() {
-        let name = entry.file_name();
-        let pid_str = name.to_str()?;
-        if !pid_str.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        let pid: u32 = pid_str.parse().ok()?;
-        let cmdline = fs::read_to_string(format!("/proc/{pid}/cmdline")).ok()?;
-        if cmdline.contains(pkg) {
-            return Some(pid);
+            thread::sleep(Duration::from_millis(300));
+            Ok(!self.is_running())
+        } else {
+            Ok(false)
         }
     }
-    None
 }
 
-fn find_game_pid() -> Option<u32> {
-    get_pid_via_pidof(GAME_PKG).or_else(|| get_pid_by_proc_scan(GAME_PKG))
+// ==================== 核心清理引擎 ====================
+struct Cleaner {
+    config: Config,
+    last_safe_mtime: Vec<Option<SystemTime>>,
+    last_full_mtime: Vec<Option<SystemTime>>,
 }
 
-fn read_tid_stat(tid: u32) -> Option<(u64, u64)> {
-    let s = fs::read_to_string(format!("/proc/{tid}/stat")).ok()?;
-    let sp = s.split_whitespace();
-    let mut idx = 0;
-    let mut utime: Option<u64> = None;
-    let mut stime: Option<u64> = None;
-    for val in sp {
-        idx += 1;
-        match idx {
-            14 => utime = val.parse().ok(),
-            15 => stime = val.parse().ok(),
-            _ => {}
+impl Cleaner {
+    fn new(config: Config) -> Self {
+        Cleaner {
+            last_safe_mtime: vec![None; config.safe_clean_paths.len()],
+            last_full_mtime: vec![None; config.full_delete_paths.len()],
+            config,
         }
     }
-    Some((utime?, stime?))
-}
 
-fn get_all_tid(pid: u32) -> Vec<u32> {
-    let mut tids = Vec::new();
-    let dir = match fs::read_dir(format!("/proc/{pid}/task")) {
-        Ok(d) => d,
-        Err(_) => return tids,
-    };
-    for entry in dir.flatten() {
-        let name = entry.file_name();
-        let tid_str = match name.to_str() {
-            Some(s) => s,
-            None => continue,
-        };
-        if let Ok(tid) = tid_str.parse::<u32>() {
-            tids.push(tid);
-        }
-    }
-    tids
-}
-
-fn restore_all(restore_list: &mut Vec<(u32, i32)>) {
-    for (tid, old_nice) in &mut *restore_list {
-        let _ = set_tid_nice(*tid, *old_nice);
-    }
-    restore_list.clear();
-}
-
-fn pid_alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
-}
-
-/// 检查pid文件，活着直接退出，死了删除旧pid
-fn check_pidfile() -> io::Result<()> {
-    if Path::new(PID_FILE).exists() {
-        let content = fs::read_to_string(PID_FILE)?;
-        match content.trim().parse::<u32>() {
-            Ok(old_pid) if pid_alive(old_pid) => {
-                eprintln!("daemon already running, pid={old_pid}");
-                std::process::exit(1);
-            }
-            _ => {
-                let _ = fs::remove_file(PID_FILE);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// 写入当前进程pid到pidfile
-fn write_pidfile() -> io::Result<()> {
-    let pid = unsafe { libc::getpid() as u32 };
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(PID_FILE)?;
-    writeln!(f, "{pid}")?;
-    Ok(())
-}
-
-fn remove_pidfile() {
-    let _ = fs::remove_file(PID_FILE);
-}
-
-fn main() -> io::Result<()> {
-    // pid文件检测，替换原来single_instance_check
-    check_pidfile()?;
-
-    daemonize()?;
-
-    // 双fork之后pid已经改变，写入真实子进程pid
-    write_pidfile()?;
-
-    let restore_list: Arc<Mutex<Vec<(u32, i32)>>> = Arc::new(Mutex::new(Vec::new()));
-    let rl_clone = Arc::clone(&restore_list);
-
-    thread::spawn(move || {
-        let mut signals = Signals::new(&[SIGINT, SIGTERM]).unwrap();
-        for _ in signals.forever() {
-            remove_pidfile();
-            let mut guard = rl_clone.lock().unwrap();
-            restore_all(&mut guard);
-            std::process::exit(0);
-        }
-    });
-
-    let mut thread_state_map: HashMap<u32, ThreadState> = HashMap::new();
-    let mut cpu_history: HashMap<u32, ThreadCpuSample> = HashMap::new();
-    const JIFF_PER_SEC: u64 = 100;
-
-    loop {
-        let Some(game_pid) = find_game_pid() else {
-            let mut g = restore_list.lock().unwrap();
-            restore_all(&mut g);
-            thread_state_map.clear();
-            cpu_history.clear();
-            thread::sleep(Duration::from_millis(SAMPLE_INTERVAL_MS));
-            continue;
-        };
-
-        let tids = get_all_tid(game_pid);
-        for tid in tids {
-            let comm = match read_thread_comm(tid) {
-                Some(c) => c,
-                None => continue,
-            };
-            // 只处理两类目标线程，其余全部直接跳过，不读stat、不改优先级
-            let is_target = comm == "TaskGraphNP 0" || comm.starts_with("Thread-");
-            if !is_target {
+    fn safe_clean(&mut self) {
+        for (idx, path) in self.config.safe_clean_paths.iter().enumerate() {
+            if !path.exists() {
+                self.last_safe_mtime[idx] = None;
                 continue;
             }
 
-            let (utime, stime) = match read_tid_stat(tid) {
-                Some(v) => v,
-                None => continue,
-            };
-
-            let entry = cpu_history.entry(tid).or_default();
-            let delta = (utime + stime).saturating_sub(entry.prev_utime + entry.prev_stime);
-            entry.prev_utime = utime;
-            entry.prev_stime = stime;
-            entry.total_delta += delta;
-            entry.sample_cnt += 1;
-
-            let instant_pct = delta as f32 * 100.0 / (JIFF_PER_SEC * SAMPLE_INTERVAL_MS / 1000) as f32;
-            let avg_pct = entry.total_delta as f32 * 100.0 / (JIFF_PER_SEC * WINDOW_SEC) as f32;
-
-            let state = thread_state_map.entry(tid).or_insert(ThreadState { orig_nice: 0, adjusted: false });
-            if state.adjusted {
+            let current_mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
+            if current_mtime == self.last_safe_mtime[idx] && current_mtime.is_some() {
                 continue;
             }
 
-            let need_throttle = if comm == "TaskGraphNP 0" {
-                true
-            } else {
-                avg_pct > AVG_CPU_THRESHOLD || instant_pct > BURST_INSTANT_THRESHOLD
+            let entries: Vec<_> = match fs::read_dir(path) {
+                Ok(entries) => entries.filter_map(|e| e.ok()).collect(),
+                Err(_) => continue,
             };
 
-            if need_throttle {
-                if let Some(nice_val) = get_tid_nice(tid) {
-                    state.orig_nice = nice_val;
-                    state.adjusted = true;
-                    let mut rl = restore_list.lock().unwrap();
-                    rl.push((tid, nice_val));
-                    let _ = set_tid_nice(tid, TARGET_NICE);
+            for entry in entries {
+                let _ = Self::remove_all(&entry.path());
+            }
+
+            // 删除子项后再读一次 mtime，写入缓存，避免下一轮空扫
+            self.last_safe_mtime[idx] = fs::metadata(path).and_then(|m| m.modified()).ok();
+        }
+    }
+
+    fn full_delete(&mut self) {
+        for (idx, path) in self.config.full_delete_paths.iter().enumerate() {
+            if !path.exists() {
+                self.last_full_mtime[idx] = None;
+                continue;
+            }
+
+            let current_mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
+            if current_mtime == self.last_full_mtime[idx] && current_mtime.is_some() {
+                continue;
+            }
+
+            match fs::symlink_metadata(path) {
+                Ok(meta) if meta.is_dir() => {
+                    // 目录：只清空内容，保留顶层目录本身，避免误删挂载点/关键目录
+                    if let Ok(entries) = fs::read_dir(path) {
+                        let entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+                        for entry in entries {
+                            let _ = Self::remove_all(&entry.path());
+                        }
+                    }
+                    self.last_full_mtime[idx] =
+                        fs::metadata(path).and_then(|m| m.modified()).ok();
+                }
+                Ok(_) => {
+                    // 文件：直接删除
+                    let _ = fs::remove_file(path);
+                    self.last_full_mtime[idx] = None;
+                }
+                Err(_) => {
+                    self.last_full_mtime[idx] = None;
                 }
             }
         }
+    }
 
-        // 清理已经消亡的tid
-        thread_state_map.retain(|tid, _| fs::exists(format!("/proc/{tid}")).unwrap_or(false));
-        cpu_history.retain(|tid, _| thread_state_map.contains_key(tid));
+    fn remove_all(path: &Path) -> std::io::Result<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.is_dir() {
+            let entries: Vec<_> = fs::read_dir(path)?
+                .filter_map(|e| e.ok())
+                .collect();
+            for entry in entries {
+                let _ = Self::remove_all(&entry.path());
+            }
+            fs::remove_dir(path)?;
+        } else {
+            fs::remove_file(path)?;
+        }
+        Ok(())
+    }
 
-        thread::sleep(Duration::from_millis(SAMPLE_INTERVAL_MS));
+    fn fix_timestamp(&mut self) {
+        for path in self.config.timestamp_targets.iter() {
+            if !path.exists() {
+                continue;
+            }
+
+            // 秒级容差判断：只要秒数为 0 就视为已达到目标时间，避免精度差异导致反复 touch
+            let already_target = match fs::metadata(path).and_then(|m| m.modified()) {
+                Ok(mtime) => match mtime.duration_since(UNIX_EPOCH) {
+                    Ok(d) => d.as_secs() == 0,
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            };
+
+            if already_target {
+                continue;
+            }
+
+            let path_str = match path.to_str() {
+                Some(s) if !s.is_empty() => s,
+                _ => continue,
+            };
+
+            let mut touched = false;
+
+            // 方法1: 系统 touch -d @0 (GNU 格式)
+            if !touched {
+                touched = Command::new("/system/bin/touch")
+                    .arg("-d")
+                    .arg("@0")
+                    .arg(path_str)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map_or(false, |s| s.success());
+            }
+
+            // 方法2: 系统 touch -t (POSIX 格式)
+            if !touched {
+                touched = Command::new("/system/bin/touch")
+                    .arg("-t")
+                    .arg("197001010000.00")
+                    .arg(path_str)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map_or(false, |s| s.success());
+            }
+
+            // 方法3: busybox touch
+            if !touched {
+                touched = Command::new("busybox")
+                    .arg("touch")
+                    .arg("-t")
+                    .arg("197001010000.00")
+                    .arg(path_str)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map_or(false, |s| s.success());
+            }
+
+            // 方法4: toybox touch (Android 新版)
+            if !touched {
+                touched = Command::new("/system/bin/toybox")
+                    .arg("touch")
+                    .arg("-t")
+                    .arg("197001010000.00")
+                    .arg(path_str)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map_or(false, |s| s.success());
+            }
+        }
+    }
+
+    fn run_cycle(&mut self) {
+        let _start = Instant::now();
+        self.safe_clean();
+        self.full_delete();
+        self.fix_timestamp();
+    }
+
+    fn daemon_loop(&mut self) -> std::io::Result<()> {
+        let my_pid = std::process::id();
+        let pid_mgr = PidManager::new(self.config.pid_file.clone());
+        pid_mgr.write_pid()?;
+
+        let mut last_reset = Instant::now();
+
+        loop {
+            match pid_mgr.read_pid() {
+                Some(pid) if pid == my_pid => {}
+                _ => break,
+            }
+
+            let cycle_start = Instant::now();
+            self.run_cycle();
+
+            if last_reset.elapsed() >= self.config.reset_interval {
+                let _ = pid_mgr.remove_pid();
+                return self.self_reset();
+            }
+
+            let elapsed = cycle_start.elapsed();
+            let sleep_duration = Duration::from_secs(self.config.interval).saturating_sub(elapsed);
+            if sleep_duration > Duration::ZERO {
+                thread::sleep(sleep_duration);
+            }
+        }
+
+        let _ = pid_mgr.remove_pid();
+        Ok(())
+    }
+
+    fn self_reset(&self) -> std::io::Result<()> {
+        let exe = std::env::current_exe()?;
+        let mut cmd = Command::new(&exe);
+        for arg in std::env::args().skip(1) {
+            cmd.arg(arg);
+        }
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let _ = cmd.spawn();
+        std::process::exit(0);
     }
 }
+
+// ==================== 守护进程模式入口 ====================
+fn run_daemon(interval: u64) -> std::io::Result<()> {
+    let my_pid = std::process::id().to_string();
+
+    let _ = Command::new("/system/bin/ionice")
+        .args(["-c", "3", "-p", &my_pid])
+        .stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let _ = Command::new("/system/bin/chrt")
+        .args(["-i", "0", "-p", &my_pid])
+        .stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let _ = Command::new("/system/bin/renice")
+        .args(["+19", "-p", &my_pid])
+        .stdout(Stdio::null()).stderr(Stdio::null()).status();
+
+    let _ = fs::write("/proc/self/timerslack_ns", "1000000000\n");
+
+    let mut config = Config::default();
+    config.interval = interval;
+
+    let mut cleaner = Cleaner::new(config);
+    cleaner.daemon_loop()
+}
+
+// ==================== 终端交互式菜单 ====================
+fn read_line() -> String {
+    let mut input = String::new();
+    let stdin = io::stdin();
+    stdin.lock().read_line(&mut input).unwrap_or(0);
+    input.trim().to_string()
+}
+
+fn check_root() -> bool {
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if line.starts_with("Uid:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 && parts[1] == "0" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn is_running() -> bool {
+    PidManager::new(PathBuf::from(PID_FILE)).is_running()
+}
+
+fn get_pid() -> Option<u32> {
+    PidManager::new(PathBuf::from(PID_FILE)).read_pid()
+}
+
+fn menu_start() {
+    if is_running() {
+        println!("⚠️ 运行中 (PID:{})", get_pid().unwrap_or(0));
+        return;
+    }
+
+    print!("间隔(秒, 回车默认{}s): ", DEFAULT_INTERVAL);
+    let _ = io::stdout().flush();
+    let input = read_line();
+    let interval: u64 = input.parse().unwrap_or(DEFAULT_INTERVAL);
+
+    println!("=== ANR清理+时间戳 Safe Rust低功耗版 ===");
+    println!("✨ 特性: 零unsafe, 单线程无锁, 变更检测低功耗, 无日志");
+
+    let exe = std::env::current_exe().unwrap_or_default();
+    let exe_str = exe.to_str().unwrap_or("");
+
+    let result = {
+        let mut cmd = Command::new("/system/bin/setsid");
+        cmd.arg(exe_str)
+            .arg("daemon")
+            .arg(interval.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cmd.spawn()
+    };
+
+    match result {
+        Ok(_) => {}
+        Err(_) => {
+            let mut cmd = Command::new(exe_str);
+            cmd.arg("daemon").arg(interval.to_string());
+            cmd.stdin(Stdio::null());
+            cmd.stdout(Stdio::null());
+            cmd.stderr(Stdio::null());
+            let _ = cmd.spawn();
+        }
+    }
+
+    for _ in 0..50 {
+        thread::sleep(Duration::from_millis(100));
+        if is_running() {
+            println!("✅ 启动成功 | PID: {} | 间隔: {}s", get_pid().unwrap_or(0), interval);
+            println!("📌 安全清理: {:?}", SAFE_CLEAN_PATHS);
+            println!("📌 全量删除: {:?}", FULL_DELETE_PATHS);
+            println!("📌 时间戳文件: {:?}", TIMESTAMP_TARGETS);
+            return;
+        }
+    }
+    println!("❌ 启动失败: PID 文件未写入");
+}
+
+fn menu_stop() {
+    if !is_running() {
+        println!("❌ 未运行");
+        return;
+    }
+
+    let pid_mgr = PidManager::new(PathBuf::from(PID_FILE));
+    match pid_mgr.stop() {
+        Ok(true) => println!("✅ 已完全终止"),
+        Ok(false) => println!("❌ 终止失败, 手动: kill -9 {}", get_pid().unwrap_or(0)),
+        Err(e) => println!("❌ 错误: {}", e),
+    }
+}
+
+fn menu_status() {
+    if is_running() {
+        println!("✅ 运行中 (PID:{})", get_pid().unwrap_or(0));
+    } else {
+        println!("❌ 未运行");
+    }
+}
+
+fn menu_once() {
+    println!("=== 单次执行模式 ===");
+    let config = Config::default();
+    let mut cleaner = Cleaner::new(config);
+    cleaner.run_cycle();
+    println!("✅ 单次执行完成");
+}
+
+fn show_menu() {
+    println!("\n=== ANR清理+时间戳 Safe Rust低功耗版 ===");
+    println!("⚠️ 特性: 零unsafe代码, 单线程无锁无竞争, 变更检测低功耗, 无日志输出");
+    println!("⚠️ 优化: 目录mtime缓存跳过, 1秒间隔下最小化I/O唤醒");
+    println!();
+    println!("1. 启动后台进程");
+    println!("2. 停止进程");
+    println!("3. 查看运行状态");
+    println!("4. 单次执行(调试)");
+    println!("5. 退出脚本");
+    print!("请输入选择(1-5): ");
+    let _ = io::stdout().flush();
+}
+
+fn main() {
+    if !check_root() {
+        println!("❌ 必须先执行 su 获取root权限");
+        return;
+    }
+
+    let exe_path = std::env::current_exe().unwrap_or_default();
+    let exe_dir = exe_path.parent().unwrap_or(Path::new("/"));
+    if exe_dir != Path::new("/data/adb") {
+        println!("⚠️ 警告: 建议将程序移至 /data/adb/ 目录运行");
+    }
+
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "daemon" {
+        let interval = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL);
+        if let Err(e) = run_daemon(interval) {
+            eprintln!("守护进程错误: {}", e);
+        }
+        return;
+    }
+
+    loop {
+        show_menu();
+        let choice = read_line();
+
+        match choice.as_str() {
+            "1" => menu_start(),
+            "2" => menu_stop(),
+            "3" => menu_status(),
+            "4" => menu_once(),
+            "5" => {
+                println!("👋 已退出, 后台进程仍运行, 可通过菜单2终止");
+                break;
+            }
+            _ => println!("❌ 请输入 1-5 的数字"),
+        }
+    }
+                    }
