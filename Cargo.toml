@@ -7,12 +7,11 @@ description = ""
 license = "MIT"
 
 [profile.release]
-# 防逆向核心配置
 opt-level = 3
-lto = true                  # 全局链接时优化，抹平函数边界，大幅提升反编译难度
-codegen-units = 1           # 单编译单元，消除分段特征
-panic = "abort"             # 移除panic字符串、栈展开元数据
-strip = "symbols"           # 编译阶段自动剥离符号
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
 debug = false
 debug-assertions = false
 overflow-checks = false
@@ -26,9 +25,11 @@ env_logger = "0.11"
 filetime = "0.2"
 walkdir = "2.5"
 chrono = "0.4"
-rustix = { version = "1.1.4", features = ["process", "fs", "param"] }
+rustix = { version = "1.1", features = ["process", "fs", "param"] }
 signal-hook = "0.4"
 ctrlc = "3.5"
 libc = "0.2"
 regex = "1.13"
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.53", features = ["full"] }
+fs4 = { version = "1.1", features = ["sync"] }
+notify = "8.2"
