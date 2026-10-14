@@ -1,4 +1,5 @@
 name: Build Anti-Reverse Musl (Zero Code Modify)
+
 on:
   push:
     branches: [ main ]
@@ -6,9 +7,9 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -17,7 +18,7 @@ jobs:
 
       - name: Install cross + binutils
         run: |
-          cargo install cross
+          cargo install cross --locked
           sudo apt update -y
           sudo apt install binutils-aarch64-linux-gnu -y
 
@@ -42,7 +43,6 @@ jobs:
       - name: Final full strip
         run: aarch64-linux-gnu-strip --strip-all target/aarch64-unknown-linux-musl/release/anr_tool
 
-      # 新增：校验二进制是否存在、是否合法ELF
       - name: Check binary file
         run: |
           BIN=target/aarch64-unknown-linux-musl/release/anr_tool
@@ -50,7 +50,7 @@ jobs:
           file $BIN
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: anr_tool-anti-reverse
           path: target/aarch64-unknown-linux-musl/release/anr_tool
