@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::thread;
+use std::os::unix::fs::PermissionsExt;
 
 // ==================== 配置区 ====================
 const DEFAULT_INTERVAL: u64 = 1;
@@ -40,6 +41,13 @@ const TIMESTAMP_TARGETS: &[&str] = &[
     "/data/adb",
 ];
 
+// obb 权限循环修复目标
+// 注意: 0o2000 仅为 setgid 位，无 rwx，会导致目录无法访问。
+// Android 常用正确值为 0o771 (drwxrwx--x) 或 0o2771 (drwxrws--x)。
+// 如需修正请把下行改为 0o2771 或 0o771。
+const OBB_PATH: &str = "/data/media/0/Android/obb";
+const OBB_PERM_MODE: u32 = 0o2000;
+
 // ==================== 配置结构体 ====================
 #[derive(Debug, Clone)]
 struct Config {
@@ -50,6 +58,8 @@ struct Config {
     target_timestamp: SystemTime,
     pid_file: PathBuf,
     reset_interval: Duration,
+    obb_path: PathBuf,
+    obb_perm_mode: u32,
 }
 
 impl Default for Config {
@@ -62,6 +72,8 @@ impl Default for Config {
             target_timestamp: UNIX_EPOCH,
             pid_file: PathBuf::from(PID_FILE),
             reset_interval: Duration::from_secs(RESET_INTERVAL_SECS),
+            obb_path: PathBuf::from(OBB_PATH),
+            obb_perm_mode: OBB_PERM_MODE,
         }
     }
 }
@@ -133,6 +145,7 @@ struct Cleaner {
     config: Config,
     last_safe_mtime: Vec<Option<SystemTime>>,
     last_full_mtime: Vec<Option<SystemTime>>,
+    last_obb_mode: Option<u32>,
 }
 
 impl Cleaner {
@@ -140,6 +153,7 @@ impl Cleaner {
         Cleaner {
             last_safe_mtime: vec![None; config.safe_clean_paths.len()],
             last_full_mtime: vec![None; config.full_delete_paths.len()],
+            last_obb_mode: None,
             config,
         }
     }
@@ -165,7 +179,6 @@ impl Cleaner {
                 let _ = Self::remove_all(&entry.path());
             }
 
-            // 删除子项后再读一次 mtime，写入缓存，避免下一轮空扫
             self.last_safe_mtime[idx] = fs::metadata(path).and_then(|m| m.modified()).ok();
         }
     }
@@ -184,7 +197,6 @@ impl Cleaner {
 
             match fs::symlink_metadata(path) {
                 Ok(meta) if meta.is_dir() => {
-                    // 目录：只清空内容，保留顶层目录本身，避免误删挂载点/关键目录
                     if let Ok(entries) = fs::read_dir(path) {
                         let entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
                         for entry in entries {
@@ -195,7 +207,6 @@ impl Cleaner {
                         fs::metadata(path).and_then(|m| m.modified()).ok();
                 }
                 Ok(_) => {
-                    // 文件：直接删除
                     let _ = fs::remove_file(path);
                     self.last_full_mtime[idx] = None;
                 }
@@ -222,13 +233,36 @@ impl Cleaner {
         Ok(())
     }
 
+    // 循环修复 /data/media/0/Android/obb 权限
+    fn fix_obb_permissions(&mut self) {
+        let path = &self.config.obb_path;
+        if !path.is_dir() {
+            self.last_obb_mode = None;
+            return;
+        }
+
+        let current = fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o7777)
+            .ok();
+
+        if current == Some(self.config.obb_perm_mode) {
+            return;
+        }
+
+        if let Ok(mut permissions) = fs::metadata(path).map(|m| m.permissions()) {
+            permissions.set_mode(self.config.obb_perm_mode);
+            if fs::set_permissions(path, permissions).is_ok() {
+                self.last_obb_mode = Some(self.config.obb_perm_mode);
+            }
+        }
+    }
+
     fn fix_timestamp(&mut self) {
         for path in self.config.timestamp_targets.iter() {
             if !path.exists() {
                 continue;
             }
 
-            // 秒级容差判断：只要秒数为 0 就视为已达到目标时间，避免精度差异导致反复 touch
             let already_target = match fs::metadata(path).and_then(|m| m.modified()) {
                 Ok(mtime) => match mtime.duration_since(UNIX_EPOCH) {
                     Ok(d) => d.as_secs() == 0,
@@ -248,7 +282,6 @@ impl Cleaner {
 
             let mut touched = false;
 
-            // 方法1: 系统 touch -d @0 (GNU 格式)
             if !touched {
                 touched = Command::new("/system/bin/touch")
                     .arg("-d")
@@ -260,7 +293,6 @@ impl Cleaner {
                     .map_or(false, |s| s.success());
             }
 
-            // 方法2: 系统 touch -t (POSIX 格式)
             if !touched {
                 touched = Command::new("/system/bin/touch")
                     .arg("-t")
@@ -272,7 +304,6 @@ impl Cleaner {
                     .map_or(false, |s| s.success());
             }
 
-            // 方法3: busybox touch
             if !touched {
                 touched = Command::new("busybox")
                     .arg("touch")
@@ -285,7 +316,6 @@ impl Cleaner {
                     .map_or(false, |s| s.success());
             }
 
-            // 方法4: toybox touch (Android 新版)
             if !touched {
                 touched = Command::new("/system/bin/toybox")
                     .arg("touch")
@@ -304,6 +334,7 @@ impl Cleaner {
         let _start = Instant::now();
         self.safe_clean();
         self.full_delete();
+        self.fix_obb_permissions();
         self.fix_timestamp();
     }
 
@@ -417,7 +448,7 @@ fn menu_start() {
     let input = read_line();
     let interval: u64 = input.parse().unwrap_or(DEFAULT_INTERVAL);
 
-    println!("=== ANR清理+时间戳 Safe Rust低功耗版 ===");
+    println!("=== ANR清理+obb权限+时间戳 Safe Rust低功耗版 ===");
     println!("✨ 特性: 零unsafe, 单线程无锁, 变更检测低功耗, 无日志");
 
     let exe = std::env::current_exe().unwrap_or_default();
@@ -452,6 +483,7 @@ fn menu_start() {
             println!("✅ 启动成功 | PID: {} | 间隔: {}s", get_pid().unwrap_or(0), interval);
             println!("📌 安全清理: {:?}", SAFE_CLEAN_PATHS);
             println!("📌 全量删除: {:?}", FULL_DELETE_PATHS);
+            println!("📌 obb权限: {} -> {:o}", OBB_PATH, OBB_PERM_MODE);
             println!("📌 时间戳文件: {:?}", TIMESTAMP_TARGETS);
             return;
         }
@@ -490,9 +522,9 @@ fn menu_once() {
 }
 
 fn show_menu() {
-    println!("\n=== ANR清理+时间戳 Safe Rust低功耗版 ===");
+    println!("\n=== ANR清理+obb权限+时间戳 Safe Rust低功耗版 ===");
     println!("⚠️ 特性: 零unsafe代码, 单线程无锁无竞争, 变更检测低功耗, 无日志输出");
-    println!("⚠️ 优化: 目录mtime缓存跳过, 1秒间隔下最小化I/O唤醒");
+    println!("⚠️ 优化: 目录mtime缓存跳过, obb权限mode缓存跳过");
     println!();
     println!("1. 启动后台进程");
     println!("2. 停止进程");
@@ -540,4 +572,4 @@ fn main() {
             _ => println!("❌ 请输入 1-5 的数字"),
         }
     }
-                    }
+            }
