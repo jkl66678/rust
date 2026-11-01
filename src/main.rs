@@ -11,7 +11,7 @@
 use std::env;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 const MADV_MERGEABLE: libc::c_int = 12;
 const IOV_MAX: usize = 1024;
