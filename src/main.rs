@@ -48,7 +48,6 @@ const TIMESTAMP_TARGETS: &[&str] = &[
     "/data/adb",
 ];
 
-// touch 方法表，顺序即尝试优先级
 const TOUCH_METHODS: &[(&str, &[&str])] = &[
     ("/system/bin/touch", &["-d", "@0"]),
     ("/system/bin/touch", &["-t", "197001010000.00"]),
@@ -126,13 +125,11 @@ impl PidManager {
             None => return Ok(false),
         };
 
-        // 先删 PID 文件，防止 daemon 自我重启或其它实例接管
         let _ = self.remove_pid();
 
         let proc_path = format!("/proc/{}", pid);
         let alive = || Path::new(&proc_path).exists();
 
-        // 先 SIGTERM，默认行为会立即终止 daemon
         let _ = Command::new("kill")
             .arg("-15")
             .arg(pid.to_string())
@@ -147,7 +144,6 @@ impl PidManager {
             }
         }
 
-        // 超时再 SIGKILL
         let _ = Command::new("kill")
             .arg("-9")
             .arg(pid.to_string())
@@ -180,7 +176,6 @@ impl Cleaner {
 
     fn safe_clean(&mut self) {
         for (idx, path) in self.config.safe_clean_paths.iter().enumerate() {
-            // 合并 exists + metadata，只 stat 一次
             let meta = match fs::metadata(path) {
                 Ok(m) => m,
                 Err(_) => {
@@ -200,7 +195,6 @@ impl Cleaner {
                 }
             }
 
-            // 删除后再读一次，避免下一轮空扫
             self.last_safe_mtime[idx] = fs::metadata(path).and_then(|m| m.modified()).ok();
         }
     }
@@ -222,13 +216,13 @@ impl Cleaner {
 
             match fs::symlink_metadata(path) {
                 Ok(m) if m.is_dir() => {
-                    // 目录只清内容，保留顶层，避免误删挂载点
                     if let Ok(entries) = fs::read_dir(path) {
                         for entry in entries.filter_map(|e| e.ok()) {
                             let _ = Self::remove_all(&entry.path());
                         }
                     }
-                    self.last_full_mtime[idx] = fs::metadata(path).and_then(|m| m.modified()).ok();
+                    self.last_full_mtime[idx] =
+                        fs::metadata(path).and_then(|m| m.modified()).ok();
                 }
                 Ok(_) => {
                     let _ = fs::remove_file(path);
@@ -277,9 +271,9 @@ impl Cleaner {
         }
     }
 
-    fn try_touch(&mut self, path_str: &str) -> bool {
-        // 优先使用上一次成功的方法
-        if let Some(m) = self.touch_method {
+    // 关联函数，只借用 touch_method 字段，避免与 config 的不可变借用冲突
+    fn try_touch(touch_method: &mut Option<usize>, path_str: &str) -> bool {
+        if let Some(m) = *touch_method {
             let (prog, args) = TOUCH_METHODS[m];
             let ok = Command::new(prog)
                 .args(args)
@@ -291,7 +285,7 @@ impl Cleaner {
             if ok {
                 return true;
             }
-            self.touch_method = None;
+            *touch_method = None;
         }
 
         for (i, (prog, args)) in TOUCH_METHODS.iter().enumerate() {
@@ -303,7 +297,7 @@ impl Cleaner {
                 .status()
                 .is_ok_and(|s| s.success());
             if ok {
-                self.touch_method = Some(i);
+                *touch_method = Some(i);
                 return true;
             }
         }
@@ -311,13 +305,13 @@ impl Cleaner {
     }
 
     fn fix_timestamp(&mut self) {
+        // 这里只不可变借用 self.config，可变借用的是 self.touch_method，字段分离合法
         for path in self.config.timestamp_targets.iter() {
             let meta = match fs::metadata(path) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
 
-            // 秒级容差，避免精度差异导致反复 touch
             let already_target = meta
                 .modified()
                 .ok()
@@ -330,7 +324,7 @@ impl Cleaner {
             }
 
             if let Some(path_str) = path.to_str().filter(|s| !s.is_empty()) {
-                let _ = self.try_touch(path_str);
+                let _ = Self::try_touch(&mut self.touch_method, path_str);
             }
         }
     }
@@ -347,7 +341,7 @@ impl Cleaner {
         let pid_mgr = PidManager::new(self.config.pid_file.clone());
         pid_mgr.write_pid()?;
 
-        let mut last_reset = Instant::now();
+        let last_reset = Instant::now();
 
         loop {
             match pid_mgr.read_pid() {
@@ -368,7 +362,6 @@ impl Cleaner {
             if sleep_duration > Duration::ZERO {
                 thread::sleep(sleep_duration);
             } else {
-                // cycle 超时，避免忙循环，至少让出 1ms
                 thread::sleep(Duration::from_millis(1));
             }
         }
@@ -377,7 +370,6 @@ impl Cleaner {
         Ok(())
     }
 
-    // 用 exec 原子替换自身，PID 不变，没有双进程窗口
     fn self_reset(&self) -> std::io::Result<()> {
         let exe = std::env::current_exe()?;
         let mut cmd = Command::new(&exe);
@@ -387,7 +379,6 @@ impl Cleaner {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        // exec 成功不返回，失败返回 io::Error
         Err(cmd.exec())
     }
 }
@@ -428,7 +419,6 @@ fn check_root() -> bool {
         for line in status.lines() {
             if line.starts_with("Uid:") {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                // Uid: real effective saved fs；real 或 effective 任一为 0 都算 root
                 if parts.len() >= 3 && (parts[1] == "0" || parts[2] == "0") {
                     return true;
                 }
@@ -482,7 +472,7 @@ fn menu_start() {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .process_group(0); // 安全 std API，替代 setsid 的部分语义
+                .process_group(0);
             let _ = cmd.spawn();
         }
     }
@@ -508,7 +498,6 @@ fn menu_stop() {
         return;
     }
 
-    // stop 会删 PID 文件，提前保存 pid 用于错误提示
     let pid = get_pid().unwrap_or(0);
     let pid_mgr = PidManager::new(PathBuf::from(PID_FILE));
     match pid_mgr.stop() {
@@ -584,4 +573,4 @@ fn main() {
             _ => println!("❌ 请输入 1-5 的数字"),
         }
     }
-            }
+        }
